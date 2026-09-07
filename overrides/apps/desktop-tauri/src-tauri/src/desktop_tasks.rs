@@ -18,13 +18,18 @@ use crate::state::AppState;
 const EVENT_NAME: &str = "desktop-task-state-changed";
 const MAX_VISIBLE_TASKS: usize = 8;
 const MAX_BOOTSTRAP_BYTES: u64 = 768 * 1024;
+const TAIL_RECONCILE_BYTES: u64 = 160 * 1024;
 const DISCOVERY_INTERVAL_TICKS: u64 = 4;
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 const DONE_GRACE: Duration = Duration::from_secs(45);
 const ACKNOWLEDGEMENT_DEBOUNCE: Duration = Duration::from_millis(450);
 const ERROR_RETENTION: Duration = Duration::from_secs(15 * 60);
-const WORKING_RETENTION: Duration = Duration::from_secs(2 * 60 * 60);
+// Working tasks are kept only while they are still the latest active turn in
+// their session. A stale Working record is corrected by tail reconciliation
+// rather than relying on a long TTL.
+const WORKING_RETENTION: Duration = Duration::from_secs(30 * 60);
 const COMPLETION_SOUND_MINIMUM: Duration = Duration::from_secs(3 * 60);
+const RECENT_FILE_WINDOW: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -97,15 +102,21 @@ pub fn start(app: AppHandle) {
         let codex_root = codex_root();
         let sessions_root = codex_root.join("sessions");
         let global_state = codex_root.join(".codex-global-state.json");
+        let session_index = codex_root.join("session_index.jsonl");
         let mut runtime = RuntimeState::default();
 
         loop {
             runtime.tick = runtime.tick.wrapping_add(1);
             if runtime.tick == 1 || runtime.tick % DISCOVERY_INTERVAL_TICKS == 0 {
                 runtime.unread_threads = read_unread_threads(&global_state);
+                let index_titles = read_session_index_titles(&session_index);
+                for (thread_id, title) in index_titles {
+                    runtime.thread_titles.insert(thread_id, title);
+                }
                 discover_session_files(&sessions_root, &mut runtime);
             }
             process_known_files(&app, &mut runtime);
+            reconcile_active_turns(&mut runtime);
             prune_tasks(&mut runtime);
             publish_snapshot(&app, &runtime);
             tokio::time::sleep(POLL_INTERVAL).await;
@@ -163,6 +174,35 @@ fn collect_jsonl(root: &Path, depth: usize, output: &mut Vec<(SystemTime, PathBu
             .unwrap_or(UNIX_EPOCH);
         output.push((modified, path));
     }
+}
+
+fn read_session_index_titles(path: &Path) -> HashMap<String, String> {
+    let Ok(file) = File::open(path) else {
+        return HashMap::new();
+    };
+    let reader = BufReader::new(file);
+    let mut titles = HashMap::new();
+    for line in reader.lines().map_while(Result::ok) {
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let Some(thread_id) = value
+            .get("thread_id")
+            .and_then(Value::as_str)
+            .or_else(|| value.get("threadId").and_then(Value::as_str))
+        else {
+            continue;
+        };
+        let title = value
+            .get("thread_name")
+            .and_then(Value::as_str)
+            .or_else(|| value.get("title").and_then(Value::as_str))
+            .and_then(clean_title);
+        if let Some(title) = title {
+            titles.insert(thread_id.to_string(), title);
+        }
+    }
+    titles
 }
 
 fn bootstrap_file(runtime: &mut RuntimeState, path: &Path) {
@@ -226,6 +266,95 @@ fn process_known_files(app: &AppHandle, runtime: &mut RuntimeState) {
     }
 }
 
+/// Re-read the tail of every recently-modified session file and rebuild the
+/// active turn status from the latest lifecycle event. This recovers from any
+/// event the incremental reader may have skipped (file truncation, partial
+/// write, watcher gap) so a Working turn never lingers past its real
+/// completion.
+fn reconcile_active_turns(runtime: &mut RuntimeState) {
+    let now = SystemTime::now();
+    let paths: Vec<PathBuf> = runtime.known_files.iter().cloned().collect();
+    for path in paths {
+        let Ok(metadata) = fs::metadata(&path) else {
+            continue;
+        };
+        let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
+        let Ok(age) = now.duration_since(modified) else {
+            continue;
+        };
+        if age > RECENT_FILE_WINDOW {
+            continue;
+        }
+        reconcile_file_tail(runtime, &path);
+    }
+}
+
+fn reconcile_file_tail(runtime: &mut RuntimeState, path: &Path) {
+    let Ok(mut file) = File::open(path) else {
+        return;
+    };
+    let Ok(metadata) = file.metadata() else {
+        return;
+    };
+    let len = metadata.len();
+    let start = len.saturating_sub(TAIL_RECONCILE_BYTES);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return;
+    }
+    let mut reader = BufReader::new(file);
+    if start > 0 {
+        let mut discard = String::new();
+        let _ = reader.read_line(&mut discard);
+    }
+    // Track the latest lifecycle event per turn seen in the tail.
+    let mut latest_by_turn: HashMap<String, (TaskStatus, DateTime<Utc>)> = HashMap::new();
+    for line in reader.lines().map_while(Result::ok) {
+        if let Some((turn_id, status, ts)) = lifecycle_event(&line) {
+            latest_by_turn.insert(turn_id, (status, ts));
+        }
+    }
+    for (turn_id, (status, ts)) in latest_by_turn {
+        if let Some(task) = runtime.tasks.get_mut(&turn_id) {
+            // Promote Working -> Completed/Error only when the tail proves it.
+            if task.status == TaskStatus::Working && status != TaskStatus::Working {
+                task.status = status;
+                task.finished_at = Some(ts);
+                task.duration = (ts - task.started_at).to_std().ok().or(task.duration);
+                if task.status == TaskStatus::Completed {
+                    runtime.active_turn_by_thread.remove(&task.thread_id);
+                }
+            }
+        }
+    }
+}
+
+fn lifecycle_event(line: &str) -> Option<(String, TaskStatus, DateTime<Utc>)> {
+    let Ok(value) = serde_json::from_str::<Value>(line) else {
+        return None;
+    };
+    if value.get("type").and_then(Value::as_str) != Some("event_msg") {
+        return None;
+    }
+    let Some(payload) = value.get("payload") else {
+        return None;
+    };
+    let Some(event_type) = payload.get("type").and_then(Value::as_str) else {
+        return None;
+    };
+    let turn_id = payload
+        .get("turn_id")
+        .and_then(Value::as_str)?
+        .to_string();
+    let timestamp = parse_timestamp(value.get("timestamp")).unwrap_or_else(Utc::now);
+    let status = match event_type {
+        "task_started" => TaskStatus::Working,
+        "task_complete" | "turn_completed" => TaskStatus::Completed,
+        "turn_aborted" | "turn_failed" | "task_failed" => TaskStatus::Error,
+        _ => return None,
+    };
+    Some((turn_id, status, timestamp))
+}
+
 fn process_line(
     runtime: &mut RuntimeState,
     path: &Path,
@@ -272,11 +401,18 @@ fn process_line(
                 .and_then(Value::as_i64)
                 .and_then(|seconds| Utc.timestamp_opt(seconds, 0).single())
                 .unwrap_or(timestamp);
-            let title = runtime
-                .thread_titles
-                .get(&thread_id)
-                .cloned()
-                .unwrap_or_else(|| "Codex Desktop 任务".to_string());
+            let title = resolve_title(runtime, &thread_id);
+            // End any previously active turn in this thread so a new
+            // task_started does not leave a stale Working record behind.
+            if let Some(previous) = runtime.active_turn_by_thread.get(&thread_id).cloned()
+                && let Some(task) = runtime.tasks.get_mut(&previous)
+            {
+                if task.status == TaskStatus::Working {
+                    task.status = TaskStatus::Completed;
+                    task.finished_at = Some(started_at);
+                    task.duration = (started_at - task.started_at).to_std().ok();
+                }
+            }
             runtime.active_turn_by_thread.insert(thread_id.clone(), turn_id.to_string());
             runtime.tasks.insert(
                 turn_id.to_string(),
@@ -293,7 +429,7 @@ fn process_line(
                 },
             );
         }
-        "task_complete" => {
+        "task_complete" | "turn_completed" => {
             let Some(turn_id) = payload.get("turn_id").and_then(Value::as_str) else {
                 return;
             };
@@ -306,11 +442,7 @@ fn process_line(
                 .and_then(Value::as_i64)
                 .and_then(|seconds| Utc.timestamp_opt(seconds, 0).single())
                 .unwrap_or(timestamp);
-            let fallback_title = runtime
-                .thread_titles
-                .get(&thread_id)
-                .cloned()
-                .unwrap_or_else(|| "Codex Desktop 任务".to_string());
+            let fallback_title = resolve_title(runtime, &thread_id);
             let task = runtime.tasks.entry(turn_id.to_string()).or_insert_with(|| TaskRecord {
                 turn_id: turn_id.to_string(),
                 thread_id: thread_id.clone(),
@@ -345,7 +477,7 @@ fn process_line(
                 notify_completion(app, &task.title, task.duration);
             }
         }
-        "turn_aborted" => {
+        "turn_aborted" | "turn_failed" | "task_failed" => {
             let Some(turn_id) = payload.get("turn_id").and_then(Value::as_str) else {
                 return;
             };
@@ -361,11 +493,7 @@ fn process_line(
                     TaskRecord {
                         turn_id: turn_id.to_string(),
                         thread_id: thread_id.clone(),
-                        title: runtime
-                            .thread_titles
-                            .get(&thread_id)
-                            .cloned()
-                            .unwrap_or_else(|| "Codex Desktop 任务".to_string()),
+                        title: resolve_title(runtime, &thread_id),
                         status: TaskStatus::Error,
                         started_at: timestamp,
                         finished_at: Some(timestamp),
@@ -377,6 +505,22 @@ fn process_line(
             }
         }
         _ => {}
+    }
+}
+
+fn resolve_title(runtime: &RuntimeState, thread_id: &str) -> String {
+    runtime
+        .thread_titles
+        .get(thread_id)
+        .cloned()
+        .unwrap_or_else(|| short_thread_id(thread_id))
+}
+
+fn short_thread_id(thread_id: &str) -> String {
+    if thread_id.len() >= 8 {
+        thread_id.chars().take(8).collect()
+    } else {
+        thread_id.to_string()
     }
 }
 

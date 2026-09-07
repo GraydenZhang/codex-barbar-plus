@@ -3,7 +3,12 @@ import type {
   StatusQuotaMetric,
   TrustState,
 } from "../lib/statusSurfaceViewModel";
+import { quotaBandFor } from "../lib/statusSurfaceViewModel";
 import { surfaceAlphaFromTransparency } from "../lib/surfaceTransparency";
+import type { UsageWindowDto } from "../types/bridge";
+
+const FIVE_HOUR_MINUTES = 300;
+const WEEKLY_MINUTES = 10_080;
 
 export interface TaskbarStatusPresentation {
   displayName: string;
@@ -60,19 +65,90 @@ function resetClockText(metric: StatusQuotaMetric | null): string | null {
   return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
 }
 
+function clampPercent(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.max(0, Math.min(100, Math.round(value)));
+}
+
+function shortLabelFor(
+  window: UsageWindowDto,
+  language: "system" | "zh-CN" | "en-US" | undefined,
+): string {
+  if (window.windowDurationMinutes === FIVE_HOUR_MINUTES) return "5H";
+  if (window.windowDurationMinutes === WEEKLY_MINUTES) {
+    return language === "en-US" ? "Wk" : "周";
+  }
+  const label = window.label?.trim();
+  return label ? Array.from(label).slice(0, 6).join("") : "Quota";
+}
+
+/**
+ * Pick the quota window for a target duration. Prefer the window that the main
+ * panel renders (state.primary, then state.secondary) so the taskbar capsule
+ * never disagrees with the tray cards. Fall back to additional windows only
+ * when neither primary nor secondary matches the requested duration.
+ */
+function windowForDuration(
+  surface: UseStatusSurfaceResult,
+  durationMinutes: number,
+): UsageWindowDto | null {
+  const state = surface.state;
+  const ordered: UsageWindowDto[] = [
+    state.primary,
+    state.secondary,
+    ...state.additionalWindows,
+  ].filter((window): window is UsageWindowDto => window !== null);
+  return (
+    ordered.find((window) => window.windowDurationMinutes === durationMinutes) ??
+    null
+  );
+}
+
+function toTaskbarMetric(
+  window: UsageWindowDto,
+  displayMode: "remaining" | "used",
+  trustState: TrustState,
+  language: "system" | "zh-CN" | "en-US" | undefined,
+): StatusQuotaMetric {
+  const remaining = clampPercent(window.remainingPercent);
+  const used = clampPercent(window.usedPercent);
+  return {
+    kind:
+      window.windowDurationMinutes === FIVE_HOUR_MINUTES
+        ? "fiveHour"
+        : window.windowDurationMinutes === WEEKLY_MINUTES
+          ? "weekly"
+          : "other",
+    limitId: window.limitId,
+    label: shortLabelFor(window, language),
+    shortLabel: shortLabelFor(window, language),
+    usedPercent: used,
+    remainingPercent: remaining,
+    displayedPercent: displayMode === "used" ? used : remaining,
+    displayMode,
+    resetText: "",
+    resetsAt: window.resetsAt,
+    band: quotaBandFor(remaining, trustState),
+  };
+}
+
 export function buildTaskbarStatusPresentation(
   surface: UseStatusSurfaceResult,
 ): TaskbarStatusPresentation {
-  const metrics = surface.metrics;
-  const fiveHour =
-    surface.primaryMetric ??
-    metrics.find((metric) => metric.kind === "fiveHour") ??
-    null;
-  const weekly =
-    surface.secondaryMetric ??
-    surface.universalMetric ??
-    metrics.find((metric) => metric.kind === "weekly") ??
-    null;
+  const displayMode = surface.bootstrap?.settings.displayMode ?? "remaining";
+  const language = surface.bootstrap?.settings.language;
+  const trustState = surface.trustState;
+
+  const fiveHourWindow = windowForDuration(surface, FIVE_HOUR_MINUTES);
+  const weeklyWindow = windowForDuration(surface, WEEKLY_MINUTES);
+
+  const fiveHour = fiveHourWindow
+    ? toTaskbarMetric(fiveHourWindow, displayMode, trustState, language)
+    : null;
+  const weekly = weeklyWindow
+    ? toTaskbarMetric(weeklyWindow, displayMode, trustState, language)
+    : null;
+
   const prefs = surface.bootstrap?.settings.taskbarPresentation;
   const showIcon = prefs?.showTaskbarIcon ?? true;
   // codex-barbar-plus intentionally keeps account identity out of the resident
@@ -120,11 +196,11 @@ export function buildTaskbarStatusPresentation(
     fiveHourResetText: fiveHourReset,
     weeklyText: weeklyValue,
     resetDateText: weeklyReset,
-    metrics,
+    metrics: surface.metrics,
     fiveHour,
     weekly,
     reset: weekly,
-    trustState: surface.trustState,
+    trustState,
     ariaLabel,
     surfaceAlpha: String(
       surfaceAlphaFromTransparency(

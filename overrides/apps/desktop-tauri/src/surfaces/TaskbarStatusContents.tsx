@@ -100,7 +100,7 @@ export function TaskbarStatusContents({
           </span>
         ) : null}
         {showDivider ? (
-          <span className="taskbar-status__reset" aria-hidden="true">
+          <span className="taskbar-status__divider" aria-hidden="true">
             ·
           </span>
         ) : null}

@@ -226,6 +226,41 @@ def patch_notification_labels(source: Path) -> None:
     path.write_text(text, encoding="utf-8")
 
 
+def patch_taskbar_css(source: Path) -> None:
+    path = source / "apps/desktop-tauri/src/surfaces/TaskbarStatus.css"
+    # The Plus capsule renders up to six inline segments (avatar, 5H metric,
+    # 5H reset clock, divider, weekly metric, weekly reset date). Switch the
+    # main button to a column-flow grid so every segment stays on a single
+    # row; the hidden measurement window still reports the real width to the
+    # Win32 sizing code, which clamps it to the original taskbar bounds.
+    replace_once(
+        path,
+        "  grid-template-columns: max-content max-content minmax(0, auto) max-content;\n",
+        "  grid-auto-flow: column;\n"
+        "  grid-auto-columns: max-content;\n",
+        "taskbar main single-row grid",
+    )
+    append_once(
+        path,
+        "/* codex-barbar-plus: taskbar dual-quota single row */",
+        r'''/* codex-barbar-plus: taskbar dual-quota single row */
+.taskbar-status__main {
+  white-space: nowrap;
+}
+
+.taskbar-status__divider {
+  color: var(--quota-unknown);
+  font-weight: 700;
+  line-height: 1;
+}
+
+.taskbar-status__metric,
+.taskbar-status__reset {
+  white-space: nowrap;
+}''',
+    )
+
+
 def patch_task_css(source: Path) -> None:
     path = source / "apps/desktop-tauri/src/surfaces/tray/TrayPanel.css"
     append_once(
@@ -239,6 +274,9 @@ def patch_task_css(source: Path) -> None:
 .tray-panel--macos .desktop-task-status__list {
   display: grid;
   gap: 7px;
+  max-height: 200px;
+  overflow-y: auto;
+  padding-right: 2px;
 }
 
 .tray-panel--macos .desktop-task-status__row {
@@ -351,6 +389,7 @@ def main() -> None:
     patch_notification_controller(source)
     patch_notification_tab(source)
     patch_notification_labels(source)
+    patch_taskbar_css(source)
     patch_task_css(source)
     patch_version_branding(source, args.version)
     print(f"codex-barbar-plus overlay applied ({args.version})")
