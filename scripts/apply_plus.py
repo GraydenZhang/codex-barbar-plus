@@ -373,7 +373,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", required=True, type=Path)
     parser.add_argument("--overlay", required=True, type=Path)
-    parser.add_argument("--version", default="1.0.30-plus.1")
+    parser.add_argument("--version", default="1.0.30-plus.2")
     args = parser.parse_args()
 
     source = args.source.resolve()
