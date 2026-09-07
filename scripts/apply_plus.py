@@ -109,6 +109,32 @@ def patch_flyout(source: Path) -> None:
         '    let _ = window.set_shadow(true);',
         "flyout open resizable",
     )
+    replace_once(
+        path,
+        'fn anchored_rect(app: &AppHandle) -> Option<Rect> {\n'
+        '    let window = app.get_webview_window(FLYOUT_LABEL)?;\n'
+        '    let monitor = current_monitor(&window)?;\n'
+        '    let work = usable_work_rect(&monitor);\n'
+        '    let logical = stored_logical_size();\n'
+        '    let (width, height) = physical_size_for(&monitor, logical);\n'
+        '    Some(place_flyout_sized(work, width, height))\n'
+        '}',
+        'fn anchored_rect(app: &AppHandle) -> Option<Rect> {\n'
+        '    let window = app.get_webview_window(FLYOUT_LABEL)?;\n'
+        '    let monitor = current_monitor(&window)?;\n'
+        '    let work = usable_work_rect(&monitor);\n'
+        '    // Preserve a user resize within the session by reusing the current\n'
+        '    // outer size; fall back to the default logical size on first open.\n'
+        '    let (width, height) = match window.outer_size() {\n'
+        '        Ok(size) if size.width > 0 && size.height > 0 => {\n'
+        '            (size.width as i32, size.height as i32)\n'
+        '        }\n'
+        '        _ => physical_size_for(&monitor, stored_logical_size()),\n'
+        '    };\n'
+        '    Some(place_flyout_sized(work, width, height))\n'
+        '}',
+        "flyout preserve resized size",
+    )
 
 
 def patch_dwm_resize_frame(source: Path) -> None:
@@ -137,6 +163,38 @@ def patch_tauri_window(source: Path) -> None:
         '        "minWidth": 360,\n'
         '        "minHeight": 480,',
         "tauri window resizable",
+    )
+
+
+def patch_window_default_size(source: Path) -> None:
+    """Unify the runtime default flyout size with tauri.conf.json (380x580)."""
+    path = source / "apps/desktop-tauri/src-tauri/src/window_positioner.rs"
+    replace_once(
+        path,
+        'pub const FLYOUT_LOGICAL_SIZE: (u32, u32) = (380, 470);',
+        'pub const FLYOUT_LOGICAL_SIZE: (u32, u32) = (380, 580);',
+        "flyout default logical size 580",
+    )
+
+
+def patch_styles_css(source: Path) -> None:
+    """Fix the upstream tray body rule that resets height to auto, which
+    defeats the scrollable panel layout. Force viewport-height sizing."""
+    path = source / "apps/desktop-tauri/src/styles.css"
+    replace_once(
+        path,
+        'html[data-surface="tray"],\n'
+        'html:has(.tray-panel) body {\n'
+        '  height: auto;\n'
+        '  min-height: 0;\n'
+        '}',
+        'html[data-surface="tray"],\n'
+        'html:has(.tray-panel) body {\n'
+        '  height: 100%;\n'
+        '  min-height: 0;\n'
+        '  overflow: hidden;\n'
+        '}',
+        "tray body viewport height",
     )
 
 
@@ -464,7 +522,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", required=True, type=Path)
     parser.add_argument("--overlay", required=True, type=Path)
-    parser.add_argument("--version", default="1.0.30-plus.3")
+    parser.add_argument("--version", default="1.0.30-plus.4")
     args = parser.parse_args()
 
     source = args.source.resolve()
@@ -477,6 +535,8 @@ def main() -> None:
     patch_flyout(source)
     patch_dwm_resize_frame(source)
     patch_tauri_window(source)
+    patch_window_default_size(source)
+    patch_styles_css(source)
     patch_window_commands(source)
     patch_main(source)
     patch_notification_controller(source)
