@@ -101,6 +101,43 @@ def patch_flyout(source: Path) -> None:
         '}',
         "flyout blur dismiss behavior",
     )
+    replace_once(
+        path,
+        '    crate::shell::dwm::force_dark_caption(&window);\n    let _ = window.set_resizable(false);\n    let _ = window.set_shadow(true);',
+        '    crate::shell::dwm::force_dark_caption(&window);\n'
+        '    let _ = window.set_resizable(true);\n'
+        '    let _ = window.set_shadow(true);',
+        "flyout open resizable",
+    )
+
+
+def patch_dwm_resize_frame(source: Path) -> None:
+    """Keep the native resize frame (WS_THICKFRAME) on the tray flyout so the
+    window edge/resize affordances work after enabling resizable."""
+    path = source / "apps/desktop-tauri/src-tauri/src/shell/dwm.rs"
+    replace_once(
+        path,
+        'pub fn force_dark_caption(win: &tauri::WebviewWindow) {\n    force_dark_caption_inner(win, false);\n}',
+        'pub fn force_dark_caption(win: &tauri::WebviewWindow) {\n'
+        '    force_dark_caption_inner(win, true);\n'
+        '}',
+        "dwm keep resize frame",
+    )
+
+
+def patch_tauri_window(source: Path) -> None:
+    """Make the tray flyout resizable (vertical focus) with sane min size."""
+    path = source / "apps/desktop-tauri/src-tauri/tauri.conf.json"
+    replace_once(
+        path,
+        '        "width": 380,\n        "height": 470,\n        "resizable": false,',
+        '        "width": 380,\n'
+        '        "height": 580,\n'
+        '        "resizable": true,\n'
+        '        "minWidth": 360,\n'
+        '        "minHeight": 480,',
+        "tauri window resizable",
+    )
 
 
 def patch_window_commands(source: Path) -> None:
@@ -159,6 +196,13 @@ def patch_main(source: Path) -> None:
         '            desktop_tasks::start(app.handle().clone());\n'
         '            notification_controller::start_update_check_loop(app.handle().clone());',
         "desktop task monitor startup",
+    )
+    replace_once(
+        path,
+        '                shell::dwm::force_dark_caption(&window);\n                let _ = window.set_resizable(false);',
+        '                shell::dwm::force_dark_caption(&window);\n'
+        '                let _ = window.set_resizable(true);',
+        "flyout window resizable",
     )
 
 
@@ -343,6 +387,53 @@ def patch_task_css(source: Path) -> None:
   border-color: rgba(43, 52, 77, 0.1);
 }''',
     )
+    append_once(
+        path,
+        "/* codex-barbar-plus: resizable scrollable panel */",
+        r'''/* codex-barbar-plus: resizable scrollable panel */
+html:has(.tray-panel),
+html:has(.tray-panel) body,
+html:has(.tray-panel) #root {
+  height: 100%;
+}
+
+.tray-panel.tray-panel--macos {
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.tray-panel--macos .tray-panel__header {
+  flex: 0 0 auto;
+}
+
+.tray-panel--macos .tray-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding-right: 2px;
+}
+
+.tray-panel--macos .tray-actions {
+  flex: 0 0 auto;
+}
+
+.tray-panel--macos .tray-scroll::-webkit-scrollbar {
+  width: 8px;
+}
+
+.tray-panel--macos .tray-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.tray-panel--macos .tray-scroll::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.22);
+  border: 2px solid transparent;
+  border-radius: 8px;
+  background-clip: padding-box;
+}''',
+    )
 
 
 def patch_version_branding(source: Path, version: str) -> None:
@@ -373,7 +464,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", required=True, type=Path)
     parser.add_argument("--overlay", required=True, type=Path)
-    parser.add_argument("--version", default="1.0.30-plus.2")
+    parser.add_argument("--version", default="1.0.30-plus.3")
     args = parser.parse_args()
 
     source = args.source.resolve()
@@ -384,6 +475,8 @@ def main() -> None:
     copy_overrides(overlay, source)
     patch_tauri_bridge(source)
     patch_flyout(source)
+    patch_dwm_resize_frame(source)
+    patch_tauri_window(source)
     patch_window_commands(source)
     patch_main(source)
     patch_notification_controller(source)

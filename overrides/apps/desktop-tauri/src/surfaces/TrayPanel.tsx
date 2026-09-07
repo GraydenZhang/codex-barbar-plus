@@ -85,49 +85,51 @@ function TrayDashboard({ bootstrap }: { bootstrap: BootstrapDto }) {
         onDismiss={dismissTrayPanel}
       />
 
-      <div className="tray-stack">
-        <ProfileSelector
-          profiles={usage.profiles}
-          selectedProfileId={usage.selectedProfileId}
+      <div className="tray-scroll">
+        <div className="tray-stack">
+          <ProfileSelector
+            profiles={usage.profiles}
+            selectedProfileId={usage.selectedProfileId}
+            copy={copy}
+            onSelect={usage.selectProfile}
+            autoFocus={usage.profiles.length > 0}
+          />
+
+          {primary ? (
+            <QuotaCard
+              window={primary}
+              displayMode={bootstrap.settings.displayMode}
+              copy={copy}
+              locale={locale}
+              timeZone={timeZone}
+              showResetTime={panel.showResetTime}
+            />
+          ) : null}
+          {secondary ? (
+            <QuotaCard
+              window={secondary}
+              displayMode={bootstrap.settings.displayMode}
+              copy={copy}
+              locale={locale}
+              timeZone={timeZone}
+              showResetTime={panel.showResetTime}
+            />
+          ) : null}
+
+          <DesktopTaskStatus snapshot={desktopTasks} language={language} />
+        </div>
+
+        <UsageStatus
+          state={usage.state}
+          isSwitching={usage.isSwitching}
           copy={copy}
-          onSelect={usage.selectProfile}
-          autoFocus={usage.profiles.length > 0}
+          locale={locale}
+          showFreshness={panel.showFreshness}
+          onRefresh={usage.refresh}
+          onOpenSettings={openSettingsWindow}
+          onOpenUsage={openCodexUsagePage}
         />
-
-        {primary ? (
-          <QuotaCard
-            window={primary}
-            displayMode={bootstrap.settings.displayMode}
-            copy={copy}
-            locale={locale}
-            timeZone={timeZone}
-            showResetTime={panel.showResetTime}
-          />
-        ) : null}
-        {secondary ? (
-          <QuotaCard
-            window={secondary}
-            displayMode={bootstrap.settings.displayMode}
-            copy={copy}
-            locale={locale}
-            timeZone={timeZone}
-            showResetTime={panel.showResetTime}
-          />
-        ) : null}
-
-        <DesktopTaskStatus snapshot={desktopTasks} language={language} />
       </div>
-
-      <UsageStatus
-        state={usage.state}
-        isSwitching={usage.isSwitching}
-        copy={copy}
-        locale={locale}
-        showFreshness={panel.showFreshness}
-        onRefresh={usage.refresh}
-        onOpenSettings={openSettingsWindow}
-        onOpenUsage={openCodexUsagePage}
-      />
 
       <TrayActions
         copy={copy}
@@ -140,7 +142,7 @@ function TrayDashboard({ bootstrap }: { bootstrap: BootstrapDto }) {
         pinned={pinned}
         onTogglePin={togglePin}
         pinLabel={zh ? "置顶" : "Pin"}
-        unpinLabel={zh ? "取消置顶" : "Unpin"}
+        unpinLabel={zh ? "已置顶" : "Pinned"}
         autoFocusRefresh={usage.profiles.length === 0}
       />
 
