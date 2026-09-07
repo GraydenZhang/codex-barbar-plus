@@ -1,0 +1,134 @@
+import type React from "react";
+import type { CSSProperties } from "react";
+import AccountAvatar from "../components/AccountAvatar";
+import { type TaskbarStatusPresentation } from "./taskbarStatusPresentation";
+
+export type TaskbarStatusContentsMode = "visible" | "measurement";
+
+export interface TaskbarStatusContentsProps {
+  mode: TaskbarStatusContentsMode;
+  presentation: TaskbarStatusPresentation;
+  closeFailed?: boolean;
+  onOpen?(): void;
+  measurementRef?: React.Ref<HTMLDivElement>;
+}
+
+export function TaskbarStatusContents({
+  mode,
+  presentation,
+  closeFailed = false,
+  onOpen,
+  measurementRef,
+}: TaskbarStatusContentsProps): JSX.Element {
+  const visible = mode === "visible";
+  const inertProps = visible ? {} : ({ inert: "" } as Record<string, string>);
+  const {
+    ariaLabel,
+    avatarAssetUri,
+    avatarKind,
+    density,
+    fiveHourText,
+    fiveHourResetText,
+    resetDateText,
+    showIcon,
+    showResetDate,
+    trustState,
+    weeklyText,
+  } = presentation;
+  const showDivider = Boolean(
+    (fiveHourText || fiveHourResetText) && (weeklyText || resetDateText),
+  );
+
+  return (
+    <div
+      {...inertProps}
+      ref={visible ? undefined : measurementRef}
+      className={`taskbar-status taskbar-status--${mode}`}
+      data-testid={`taskbar-status-${mode}`}
+      data-trust={visible ? trustState : undefined}
+      aria-hidden={visible ? undefined : "true"}
+      style={{
+        "--surface-bg-alpha": presentation.surfaceAlpha,
+      } as CSSProperties}
+    >
+      {visible ? (
+        <span className="taskbar-status__live" role="status" aria-live="polite">
+          {closeFailed ? "关闭失败，点击重试" : ""}
+        </span>
+      ) : null}
+      <button
+        type="button"
+        className="taskbar-status__main"
+        data-density={density}
+        aria-label={visible ? ariaLabel : undefined}
+        tabIndex={visible ? undefined : -1}
+        onClick={visible && onOpen ? () => onOpen() : undefined}
+      >
+        {showIcon ? (
+          <span className="taskbar-status__avatar" aria-hidden="true">
+            <AccountAvatar
+              identity={{
+                presentationName: presentation.displayName,
+                avatarKind,
+                avatarAssetUri,
+              }}
+              size={22}
+              decorative
+            />
+          </span>
+        ) : null}
+        {fiveHourText ? (
+          <span
+            className="taskbar-status__quota-track"
+            data-testid={visible ? "taskbar-status-five-hour" : undefined}
+          >
+            <span
+              className="taskbar-status__metric"
+              data-band={presentation.fiveHour?.band}
+              title={fiveHourText}
+            >
+              {fiveHourText}
+            </span>
+          </span>
+        ) : null}
+        {fiveHourResetText ? (
+          <span
+            className="taskbar-status__reset"
+            title={presentation.fiveHour?.resetText ?? "无重置时间"}
+          >
+            {fiveHourResetText}
+          </span>
+        ) : null}
+        {showDivider ? (
+          <span className="taskbar-status__reset" aria-hidden="true">
+            ·
+          </span>
+        ) : null}
+        {weeklyText ? (
+          <span
+            className="taskbar-status__quota-track"
+            data-testid={visible ? "taskbar-status-quota-track" : undefined}
+          >
+            <span
+              className="taskbar-status__metric"
+              data-testid={visible ? "taskbar-status-metric" : undefined}
+              data-band={presentation.weekly?.band}
+              title={weeklyText}
+            >
+              {weeklyText}
+            </span>
+          </span>
+        ) : null}
+        {showResetDate && resetDateText ? (
+          <span
+            className="taskbar-status__reset"
+            data-testid={visible ? "taskbar-status-reset" : undefined}
+            title={presentation.weekly?.resetText ?? "无重置时间"}
+          >
+            {resetDateText}
+          </span>
+        ) : null}
+      </button>
+    </div>
+  );
+}

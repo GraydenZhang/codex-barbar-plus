@@ -1,0 +1,93 @@
+name: Build Windows portable
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: codex-barbar-plus Windows x64
+    runs-on: windows-2025
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout plus overlay
+        uses: actions/checkout@v4
+
+      - name: Fetch upstream codex-barbar v1.0.30
+        shell: pwsh
+        run: git clone --depth 1 --branch v1.0.30 https://github.com/naipi11/codex-barbar.git upstream
+
+      - name: Apply focused Plus changes
+        shell: pwsh
+        run: python scripts/apply_plus.py --source upstream --overlay . --version 1.0.30-plus.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: upstream
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.18.1
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: upstream/apps/desktop-tauri/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        shell: pwsh
+        run: pnpm --dir upstream/apps/desktop-tauri install --frozen-lockfile
+
+      - name: Type-check and build frontend
+        shell: pwsh
+        run: pnpm --dir upstream/apps/desktop-tauri run build
+
+      - name: Check Rust integration
+        working-directory: upstream
+        shell: pwsh
+        run: cargo check --workspace
+
+      - name: Build native Tauri application
+        shell: pwsh
+        run: pnpm --dir upstream/apps/desktop-tauri run tauri:build
+
+      - name: Stage portable package
+        shell: pwsh
+        run: |
+          $out = Join-Path $PWD 'artifacts'
+          $stage = Join-Path $out 'portable'
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+
+          Copy-Item 'upstream\target\release\codex-barbar.exe' (Join-Path $stage 'codex-barbar.exe')
+          foreach ($doc in @('LICENSE','UPSTREAMS.md','README.md','README.zh-CN.md','PORTABLE.md')) {
+            Copy-Item (Join-Path 'upstream' $doc) (Join-Path $stage $doc)
+          }
+          Copy-Item 'README-PLUS.md' (Join-Path $stage 'README-PLUS.md')
+
+          $zip = Join-Path $out 'codex-barbar-plus_1.0.30-plus.1_x64-portable.zip'
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip -CompressionLevel Optimal -Force
+          $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
+          "$hash  codex-barbar-plus_1.0.30-plus.1_x64-portable.zip" | Set-Content -Encoding ascii (Join-Path $out 'SHA256SUMS.txt')
+
+      - name: Upload portable
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-barbar-plus-windows-x64-portable
+          path: |
+            artifacts/codex-barbar-plus_1.0.30-plus.1_x64-portable.zip
+            artifacts/SHA256SUMS.txt
+          if-no-files-found: error
