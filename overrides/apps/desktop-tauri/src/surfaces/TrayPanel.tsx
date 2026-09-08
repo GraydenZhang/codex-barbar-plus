@@ -83,6 +83,10 @@ function TrayDashboard({ bootstrap }: { bootstrap: BootstrapDto }) {
         copy={copy}
         showAccountStatus={panel.showAccountStatus}
         onDismiss={dismissTrayPanel}
+        pinned={pinned}
+        onTogglePin={togglePin}
+        pinLabel={zh ? "置顶" : "Pin"}
+        unpinLabel={zh ? "已置顶" : "Pinned"}
       />
 
       <div className="tray-scroll">
@@ -139,10 +143,6 @@ function TrayDashboard({ bootstrap }: { bootstrap: BootstrapDto }) {
         onOpenSettings={openSettingsWindow}
         onDismiss={dismissTrayPanel}
         onQuit={quitApp}
-        pinned={pinned}
-        onTogglePin={togglePin}
-        pinLabel={zh ? "置顶" : "Pin"}
-        unpinLabel={zh ? "已置顶" : "Pinned"}
         autoFocusRefresh={usage.profiles.length === 0}
       />
 

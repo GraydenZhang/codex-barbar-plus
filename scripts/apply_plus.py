@@ -492,6 +492,39 @@ html:has(.tray-panel) #root {
   background-clip: padding-box;
 }''',
     )
+    append_once(
+        path,
+        "/* codex-barbar-plus: header pin toggle */",
+        r'''/* codex-barbar-plus: header pin toggle */
+.tray-panel--macos .tray-panel__pin svg {
+  display: block;
+  width: 14px;
+  height: 14px;
+}
+
+.tray-panel--macos .tray-panel__pin[data-pinned="true"] {
+  color: var(--tray-accent);
+  background: rgba(48, 209, 88, 0.16);
+  border-color: rgba(48, 209, 88, 0.5);
+}
+
+.tray-panel--macos .tray-panel__pin[data-pinned="true"]:hover {
+  color: var(--tray-accent);
+  background: rgba(48, 209, 88, 0.26);
+  border-color: rgba(48, 209, 88, 0.65);
+  transform: scale(1.04);
+}
+
+[data-theme="light"] .tray-panel--macos .tray-panel__pin[data-pinned="true"] {
+  background: rgba(36, 138, 61, 0.12);
+  border-color: rgba(36, 138, 61, 0.4);
+}
+
+[data-theme="light"] .tray-panel--macos .tray-panel__pin[data-pinned="true"]:hover {
+  background: rgba(36, 138, 61, 0.2);
+  border-color: rgba(36, 138, 61, 0.55);
+}''',
+    )
 
 
 def patch_version_branding(source: Path, version: str) -> None:
@@ -522,7 +555,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", required=True, type=Path)
     parser.add_argument("--overlay", required=True, type=Path)
-    parser.add_argument("--version", default="1.0.30-plus.4")
+    parser.add_argument("--version", default="1.0.30-plus.5")
     args = parser.parse_args()
 
     source = args.source.resolve()

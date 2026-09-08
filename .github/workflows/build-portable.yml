@@ -24,7 +24,7 @@ jobs:
 
       - name: Apply focused Plus changes
         shell: pwsh
-        run: python scripts/apply_plus.py --source upstream --overlay . --version 1.0.30-plus.4
+        run: python scripts/apply_plus.py --source upstream --overlay . --version 1.0.30-plus.5
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -78,16 +78,16 @@ jobs:
           }
           Copy-Item 'README-PLUS.md' (Join-Path $stage 'README-PLUS.md')
 
-          $zip = Join-Path $out 'codex-barbar-plus_1.0.30-plus.4_x64-portable.zip'
+          $zip = Join-Path $out 'codex-barbar-plus_1.0.30-plus.5_x64-portable.zip'
           Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip -CompressionLevel Optimal -Force
           $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
-          "$hash  codex-barbar-plus_1.0.30-plus.4_x64-portable.zip" | Set-Content -Encoding ascii (Join-Path $out 'SHA256SUMS.txt')
+          "$hash  codex-barbar-plus_1.0.30-plus.5_x64-portable.zip" | Set-Content -Encoding ascii (Join-Path $out 'SHA256SUMS.txt')
 
       - name: Upload portable
         uses: actions/upload-artifact@v4
         with:
           name: codex-barbar-plus-windows-x64-portable
           path: |
-            artifacts/codex-barbar-plus_1.0.30-plus.4_x64-portable.zip
+            artifacts/codex-barbar-plus_1.0.30-plus.5_x64-portable.zip
             artifacts/SHA256SUMS.txt
           if-no-files-found: error
