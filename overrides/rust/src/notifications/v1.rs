@@ -171,36 +171,31 @@ impl V1NotificationEngine {
         profile.known_reset_credits = reset_credits;
 
         let mut events = Vec::new();
-        // Plus treats quota-reset notification as a standalone convenience:
-        // the existing reset toggle is on by default and remains effective even
-        // when the upstream master switch for warning/update alerts is off.
-        if preferences.weekly_reset_enabled {
-            if five_hour_reset {
-                events.push(V1NotificationEvent::FiveHourReset);
-            }
-            if weekly_reset {
-                events.push(V1NotificationEvent::WeeklyReset);
-            }
-        }
-
         if preferences.enabled {
-            if !first_weekly_observation && !weekly_reset {
-                if let (Some(previous_band), Some(current_band), Some(remaining_percent)) =
+            if preferences.weekly_reset_enabled {
+                if five_hour_reset {
+                    events.push(V1NotificationEvent::FiveHourReset);
+                }
+                if weekly_reset {
+                    events.push(V1NotificationEvent::WeeklyReset);
+                }
+            }
+
+            if !first_weekly_observation
+                && !weekly_reset
+                && let (Some(previous_band), Some(current_band), Some(remaining_percent)) =
                     (previous_band, current_band, weekly_remaining)
-                {
-                    match (previous_band, current_band) {
-                        (QuotaBand::Normal, QuotaBand::Warning)
-                            if preferences.warning_enabled =>
-                        {
-                            events.push(V1NotificationEvent::Warning { remaining_percent });
-                        }
-                        (QuotaBand::Normal | QuotaBand::Warning, QuotaBand::Danger)
-                            if preferences.danger_enabled =>
-                        {
-                            events.push(V1NotificationEvent::Danger { remaining_percent });
-                        }
-                        _ => {}
+            {
+                match (previous_band, current_band) {
+                    (QuotaBand::Normal, QuotaBand::Warning) if preferences.warning_enabled => {
+                        events.push(V1NotificationEvent::Warning { remaining_percent });
                     }
+                    (QuotaBand::Normal | QuotaBand::Warning, QuotaBand::Danger)
+                        if preferences.danger_enabled =>
+                    {
+                        events.push(V1NotificationEvent::Danger { remaining_percent });
+                    }
+                    _ => {}
                 }
             }
 
@@ -377,8 +372,7 @@ fn confirmed_window_reset(
     current: &UsageWindow,
     observed_at: DateTime<Utc>,
 ) -> bool {
-    let (Some(previous_reset_at), Some(current_reset_at)) =
-        (previous_reset_at, current.resets_at)
+    let (Some(previous_reset_at), Some(current_reset_at)) = (previous_reset_at, current.resets_at)
     else {
         return false;
     };
@@ -497,14 +491,16 @@ mod tests {
         let first_reset = now + ChronoDuration::minutes(2);
         let next_reset = first_reset + ChronoDuration::hours(5);
 
-        assert!(engine
-            .observe_usage(
-                &enabled(),
-                id,
-                &state_with_windows(id, 98.0, first_reset, 30.0, week, now),
-                None,
-            )
-            .is_empty());
+        assert!(
+            engine
+                .observe_usage(
+                    &enabled(),
+                    id,
+                    &state_with_windows(id, 98.0, first_reset, 30.0, week, now),
+                    None,
+                )
+                .is_empty()
+        );
 
         let after = first_reset + ChronoDuration::minutes(1);
         assert_eq!(
@@ -516,14 +512,16 @@ mod tests {
             ),
             vec![V1NotificationEvent::FiveHourReset]
         );
-        assert!(engine
-            .observe_usage(
-                &enabled(),
-                id,
-                &state_with_windows(id, 5.0, next_reset, 30.0, week, after),
-                None,
-            )
-            .is_empty());
+        assert!(
+            engine
+                .observe_usage(
+                    &enabled(),
+                    id,
+                    &state_with_windows(id, 5.0, next_reset, 30.0, week, after),
+                    None,
+                )
+                .is_empty()
+        );
     }
 
     #[test]
@@ -536,29 +534,33 @@ mod tests {
         let five_b = five_a + ChronoDuration::minutes(15);
         let week = now + ChronoDuration::days(3);
 
-        assert!(engine
-            .observe_usage(
-                &enabled(),
-                id,
-                &state_with_windows(id, 70.0, five_a, 20.0, week, now),
-                None,
-            )
-            .is_empty());
-        assert!(engine
-            .observe_usage(
-                &enabled(),
-                id,
-                &state_with_windows(
+        assert!(
+            engine
+                .observe_usage(
+                    &enabled(),
                     id,
-                    71.0,
-                    five_b,
-                    20.0,
-                    week,
-                    now + ChronoDuration::minutes(1),
-                ),
-                None,
-            )
-            .is_empty());
+                    &state_with_windows(id, 70.0, five_a, 20.0, week, now),
+                    None,
+                )
+                .is_empty()
+        );
+        assert!(
+            engine
+                .observe_usage(
+                    &enabled(),
+                    id,
+                    &state_with_windows(
+                        id,
+                        71.0,
+                        five_b,
+                        20.0,
+                        week,
+                        now + ChronoDuration::minutes(1),
+                    ),
+                    None,
+                )
+                .is_empty()
+        );
     }
 
     #[test]
@@ -571,14 +573,16 @@ mod tests {
         let week_a = now + ChronoDuration::minutes(2);
         let week_b = week_a + ChronoDuration::days(7);
 
-        assert!(engine
-            .observe_usage(
-                &enabled(),
-                id,
-                &state_with_windows(id, 10.0, five, 20.0, week_a, now),
-                None,
-            )
-            .is_empty());
+        assert!(
+            engine
+                .observe_usage(
+                    &enabled(),
+                    id,
+                    &state_with_windows(id, 10.0, five, 20.0, week_a, now),
+                    None,
+                )
+                .is_empty()
+        );
         assert_eq!(
             engine.observe_usage(
                 &enabled(),
@@ -612,6 +616,64 @@ mod tests {
                 None,
             ),
             vec![V1NotificationEvent::WeeklyReset]
+        );
+    }
+
+    #[test]
+    fn disabled_master_updates_reset_baseline_without_backfilling_on_reenable() {
+        let (_temp, paths) = state_path();
+        let mut engine = V1NotificationEngine::load(&paths);
+        let id = Uuid::new_v4();
+        let now = DateTime::from_timestamp(1_780_000_000, 0).unwrap();
+        let five_a = now + ChronoDuration::minutes(2);
+        let five_b = five_a + ChronoDuration::hours(5);
+        let week = now + ChronoDuration::days(4);
+        let mut disabled = enabled();
+        disabled.enabled = false;
+
+        assert!(
+            engine
+                .observe_usage(
+                    &disabled,
+                    id,
+                    &state_with_windows(id, 90.0, five_a, 20.0, week, now),
+                    None,
+                )
+                .is_empty()
+        );
+        assert!(
+            engine
+                .observe_usage(
+                    &disabled,
+                    id,
+                    &state_with_windows(
+                        id,
+                        5.0,
+                        five_b,
+                        20.0,
+                        week,
+                        five_a + ChronoDuration::minutes(1),
+                    ),
+                    None,
+                )
+                .is_empty()
+        );
+        assert!(
+            engine
+                .observe_usage(
+                    &enabled(),
+                    id,
+                    &state_with_windows(
+                        id,
+                        6.0,
+                        five_b,
+                        20.0,
+                        week,
+                        five_a + ChronoDuration::minutes(2),
+                    ),
+                    None,
+                )
+                .is_empty()
         );
     }
 }

@@ -10,7 +10,6 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use codexbar::core::{ProfileUsageState, RefreshTrigger};
-use codexbar::storage::UsageRepository;
 use tauri::Manager;
 
 use crate::state::AppState;
@@ -54,13 +53,11 @@ pub fn start(app: tauri::AppHandle) {
                 .ok()
                 .and_then(|state| due_reset_at(&state, Utc::now()));
 
-            let reset_probe_due = due_reset.is_some_and(|reset_at| {
-                match last_reset_probe {
-                    Some((previous_reset, attempted)) if previous_reset == reset_at => {
-                        attempted.elapsed() >= RESET_RETRY
-                    }
-                    _ => true,
+            let reset_probe_due = due_reset.is_some_and(|reset_at| match last_reset_probe {
+                Some((previous_reset, attempted)) if previous_reset == reset_at => {
+                    attempted.elapsed() >= RESET_RETRY
                 }
+                _ => true,
             });
 
             let regular_due = if settings.refresh_interval_seconds == 0 {
@@ -110,13 +107,12 @@ fn due_reset_at(state: &ProfileUsageState, now: DateTime<Utc>) -> Option<DateTim
 
 #[cfg(test)]
 mod tests {
-    use chrono::{DateTime, Duration as ChronoDuration, Utc};
+    use chrono::{DateTime, Duration as ChronoDuration};
     use uuid::Uuid;
 
     use super::due_reset_at;
     use codexbar::core::{
-        Freshness, ProfileUsageSnapshot, ProfileUsageState, RefreshStatus, UsageSource,
-        UsageWindow,
+        Freshness, ProfileUsageSnapshot, ProfileUsageState, RefreshStatus, UsageSource, UsageWindow,
     };
 
     #[test]

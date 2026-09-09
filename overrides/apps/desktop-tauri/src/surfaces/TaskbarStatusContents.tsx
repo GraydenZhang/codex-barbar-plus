@@ -26,11 +26,14 @@ export function TaskbarStatusContents({
     ariaLabel,
     avatarAssetUri,
     avatarKind,
+    compactIdentity,
     density,
+    displayName,
     fiveHourText,
     fiveHourResetText,
     resetDateText,
     showIcon,
+    showAccount,
     showResetDate,
     trustState,
     weeklyText,
@@ -43,7 +46,7 @@ export function TaskbarStatusContents({
     <div
       {...inertProps}
       ref={visible ? undefined : measurementRef}
-      className={`taskbar-status taskbar-status--${mode}`}
+      className={`taskbar-status taskbar-status--${mode} taskbar-status--${presentation.plusMode ? "plus" : "original"}`}
       data-testid={`taskbar-status-${mode}`}
       data-trust={visible ? trustState : undefined}
       aria-hidden={visible ? undefined : "true"}
@@ -61,6 +64,7 @@ export function TaskbarStatusContents({
         className="taskbar-status__main"
         data-density={density}
         aria-label={visible ? ariaLabel : undefined}
+        title={displayName}
         tabIndex={visible ? undefined : -1}
         onClick={visible && onOpen ? () => onOpen() : undefined}
       >
@@ -76,6 +80,9 @@ export function TaskbarStatusContents({
               decorative
             />
           </span>
+        ) : null}
+        {!presentation.plusMode && showAccount && compactIdentity ? (
+          <span className="taskbar-status__identity">{compactIdentity}</span>
         ) : null}
         {fiveHourText ? (
           <span

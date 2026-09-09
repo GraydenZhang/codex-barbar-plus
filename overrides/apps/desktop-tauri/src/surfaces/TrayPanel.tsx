@@ -29,6 +29,19 @@ function systemTimeZone(): string {
   }
 }
 
+function lastUpdatedText(
+  fetchedAt: string | null,
+  language: "system" | "zh-CN" | "en-US",
+): string {
+  if (!fetchedAt) return language === "en-US" ? "Not updated yet" : "尚未更新";
+  const date = new Date(fetchedAt);
+  if (!Number.isFinite(date.getTime())) {
+    return language === "en-US" ? "Not updated yet" : "尚未更新";
+  }
+  const stamp = `${date.getMonth() + 1}/${date.getDate()} ${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+  return language === "en-US" ? `Last updated: ${stamp}` : `最后更新：${stamp}`;
+}
+
 function TrayDashboard({ bootstrap }: { bootstrap: BootstrapDto }) {
   const usage = useProfileUsage(bootstrap);
   const desktopTasks = useDesktopTasks();
@@ -77,7 +90,7 @@ function TrayDashboard({ bootstrap }: { bootstrap: BootstrapDto }) {
       aria-label="codex-barbar tray panel"
     >
       <TrayHeader
-        productName="codex-barbar"
+        lastUpdatedText={lastUpdatedText(usage.state.fetchedAt, language)}
         version={bootstrap.version}
         profile={selectedProfile ?? null}
         copy={copy}
@@ -128,7 +141,6 @@ function TrayDashboard({ bootstrap }: { bootstrap: BootstrapDto }) {
           isSwitching={usage.isSwitching}
           copy={copy}
           locale={locale}
-          showFreshness={panel.showFreshness}
           onRefresh={usage.refresh}
           onOpenSettings={openSettingsWindow}
           onOpenUsage={openCodexUsagePage}
@@ -188,7 +200,7 @@ export default function TrayPanel() {
     return (
       <main className="tray-panel tray-panel--macos" aria-label="codex-barbar tray panel">
         <TrayHeader
-          productName="codex-barbar"
+          lastUpdatedText="尚未更新"
           version="…"
           profile={null}
           copy={trayCopy("system")}

@@ -11,6 +11,7 @@ const FIVE_HOUR_MINUTES = 300;
 const WEEKLY_MINUTES = 10_080;
 
 export interface TaskbarStatusPresentation {
+  plusMode: boolean;
   displayName: string;
   compactIdentity: string | null;
   avatarKind: "default" | "official" | "manual";
@@ -150,23 +151,24 @@ export function buildTaskbarStatusPresentation(
     : null;
 
   const prefs = surface.bootstrap?.settings.taskbarPresentation;
+  const plusMode = surface.bootstrap?.settings.taskbarShowFiveHour ?? true;
   const showIcon = prefs?.showTaskbarIcon ?? true;
-  // codex-barbar-plus intentionally keeps account identity out of the resident
-  // taskbar capsule. The full tray panel still shows the selected account.
-  const showAccount = false;
+  const showAccount = plusMode ? false : (prefs?.showTaskbarAccount ?? true);
   const showWeeklyLabel = prefs?.showWeeklyLabel ?? true;
   const showWeeklyPercent = prefs?.showWeeklyPercent ?? true;
   const showResetDate = prefs?.showResetDate ?? true;
   const density = prefs?.density ?? "compact";
-  const fiveHourValue = fiveHour ? compactTaskbarMetric(fiveHour) : null;
-  const fiveHourReset = resetClockText(fiveHour);
-  const weeklyValue = weeklyText(weekly, showWeeklyLabel, showWeeklyPercent);
-  const weeklyReset = showResetDate ? resetDateText(weekly) : null;
+  const originalMetric = surface.universalMetric;
+  const fiveHourValue = plusMode && fiveHour ? compactTaskbarMetric(fiveHour) : null;
+  const fiveHourReset = plusMode ? resetClockText(fiveHour) : null;
+  const displayedWeekly = plusMode ? weekly : originalMetric;
+  const weeklyValue = weeklyText(displayedWeekly, showWeeklyLabel, showWeeklyPercent);
+  const weeklyReset = showResetDate ? resetDateText(displayedWeekly) : null;
   const metricsText = [
     fiveHourValue,
     fiveHourReset ? `重置 ${fiveHourReset}` : null,
     weeklyValue,
-    weeklyReset ? `重置 ${weeklyReset}` : null,
+    plusMode && weeklyReset ? `重置 ${weeklyReset}` : null,
   ]
     .filter(Boolean)
     .join("，") || "无可用额度";
@@ -174,7 +176,9 @@ export function buildTaskbarStatusPresentation(
     surface.trustState === "cached" ? "缓存数据" : surface.refreshStatus;
   const ariaLabel = [
     "打开完整面板",
+    plusMode ? null : surface.displayName,
     metricsText,
+    plusMode ? null : originalMetric?.resetText,
     trustText,
     surface.updatedText,
   ]
@@ -182,8 +186,9 @@ export function buildTaskbarStatusPresentation(
     .join("，");
 
   return {
+    plusMode,
     displayName: surface.displayName,
-    compactIdentity: null,
+    compactIdentity: showAccount ? surface.compactIdentity : null,
     avatarKind: surface.avatarKind,
     avatarAssetUri: surface.avatarAssetUri,
     showIcon,
@@ -196,10 +201,10 @@ export function buildTaskbarStatusPresentation(
     fiveHourResetText: fiveHourReset,
     weeklyText: weeklyValue,
     resetDateText: weeklyReset,
-    metrics: surface.metrics,
-    fiveHour,
-    weekly,
-    reset: weekly,
+    metrics: plusMode ? surface.metrics : (originalMetric ? [originalMetric] : []),
+    fiveHour: plusMode ? fiveHour : null,
+    weekly: displayedWeekly,
+    reset: displayedWeekly,
     trustState,
     ariaLabel,
     surfaceAlpha: String(

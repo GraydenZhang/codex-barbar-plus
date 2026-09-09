@@ -69,6 +69,18 @@ def patch_tauri_bridge(source: Path) -> None:
         'export const quitApp = () => invoke<void>(commands.quitApp);',
         "tauri bridge exports",
     )
+    test = source / "apps/desktop-tauri/src/types/bridge.test.ts"
+    replace_once(
+        test,
+        '      getCurrentSurfaceState: "get_current_surface_state",\n'
+        '      quitApp: "quit_app",',
+        '      getCurrentSurfaceState: "get_current_surface_state",\n'
+        '      getFlyoutPinned: "get_flyout_pinned",\n'
+        '      setFlyoutPinned: "set_flyout_pinned",\n'
+        '      getDesktopTaskSnapshot: "get_desktop_task_snapshot",\n'
+        '      quitApp: "quit_app",',
+        "bridge command contract test",
+    )
 
 
 def patch_flyout(source: Path) -> None:
@@ -91,13 +103,14 @@ def patch_flyout(source: Path) -> None:
         '    if let Some(window) = app.get_webview_window(FLYOUT_LABEL) {\n'
         '        // The upstream flyout is already always-on-top. Pinning only\n'
         '        // changes blur-dismiss behavior; keep the original z-order.\n'
-        '        window.set_always_on_top(true).map_err(|error| error.to_string())?;\n'
+        '        window\n'
+        '            .set_always_on_top(true)\n'
+        '            .map_err(|error| error.to_string())?;\n'
         '    }\n'
         '    Ok(())\n'
         '}\n\n'
         'pub fn should_blur_dismiss() -> bool {\n'
-        '    !FLYOUT_INTERACTING.load(Ordering::SeqCst)\n'
-        '        && !FLYOUT_PINNED.load(Ordering::SeqCst)\n'
+        '    !FLYOUT_INTERACTING.load(Ordering::SeqCst) && !FLYOUT_PINNED.load(Ordering::SeqCst)\n'
         '}',
         "flyout blur dismiss behavior",
     )
@@ -126,14 +139,62 @@ def patch_flyout(source: Path) -> None:
         '    // Preserve a user resize within the session by reusing the current\n'
         '    // outer size; fall back to the default logical size on first open.\n'
         '    let (width, height) = match window.outer_size() {\n'
-        '        Ok(size) if size.width > 0 && size.height > 0 => {\n'
-        '            (size.width as i32, size.height as i32)\n'
-        '        }\n'
+        '        Ok(size) if size.width > 0 && size.height > 0 => (size.width as i32, size.height as i32),\n'
         '        _ => physical_size_for(&monitor, stored_logical_size()),\n'
         '    };\n'
         '    Some(place_flyout_sized(work, width, height))\n'
         '}',
         "flyout preserve resized size",
+    )
+    replace_once(
+        path,
+        'pub fn set_interacting(active: bool) {\n    FLYOUT_INTERACTING.store(active, Ordering::SeqCst);\n}',
+        'pub fn set_interacting(active: bool) {\n'
+        '    FLYOUT_INTERACTING.store(active, Ordering::SeqCst);\n'
+        '}\n\n'
+        'fn is_interacting() -> bool {\n'
+        '    FLYOUT_INTERACTING.load(Ordering::SeqCst)\n'
+        '}',
+        "flyout interaction state",
+    )
+    replace_once(
+        path,
+        '    if !window.is_visible().unwrap_or(false) || !should_blur_dismiss() {\n        return;\n    }',
+        '    if !window.is_visible().unwrap_or(false) || is_interacting() {\n        return;\n    }',
+        "flyout correction independent of pin state",
+    )
+    replace_once(
+        path,
+        '    let next = clamp_to_monitor(\n        monitor_rect(&monitor),',
+        '    let next = clamp_to_monitor(\n        usable_work_rect(&monitor),',
+        "flyout correction uses work area",
+    )
+    replace_once(
+        path,
+        '        clamp_to_monitor(\n            monitor_rect(&monitor),',
+        '        clamp_to_monitor(\n            usable_work_rect(&monitor),',
+        "flyout content sizing uses work area",
+    )
+    replace_once(
+        path,
+        '            clamp_to_monitor(\n                monitor_rect(monitor),',
+        '            clamp_to_monitor(\n                usable_work_rect(monitor),',
+        "flyout explicit open uses work area",
+    )
+    replace_once(
+        path,
+        'fn monitor_rect(monitor: &tauri::Monitor) -> Rect {\n'
+        '    let size = monitor.size();\n'
+        '    let pos = monitor.position();\n'
+        '    Rect {\n'
+        '        x: pos.x,\n'
+        '        y: pos.y,\n'
+        '        width: size.width.min(i32::MAX as u32) as i32,\n'
+        '        height: size.height.min(i32::MAX as u32) as i32,\n'
+        '    }\n'
+        '}\n',
+        '',
+        "remove obsolete full-monitor geometry",
     )
 
 
@@ -148,6 +209,57 @@ def patch_dwm_resize_frame(source: Path) -> None:
         '    force_dark_caption_inner(win, true);\n'
         '}',
         "dwm keep resize frame",
+    )
+    replace_once(
+        path,
+        'const WM_GETMINMAXINFO: u32 = 0x0024;\n#[cfg(windows)]\nconst WM_ENTERSIZEMOVE: u32 = 0x0231;',
+        'const WM_GETMINMAXINFO: u32 = 0x0024;\n'
+        '#[cfg(windows)]\n'
+        'const WM_SIZING: u32 = 0x0214;\n'
+        '#[cfg(windows)]\n'
+        'const WM_ENTERSIZEMOVE: u32 = 0x0231;',
+        "dwm sizing message",
+    )
+    replace_once(
+        path,
+        '        WM_GETMINMAXINFO => {',
+        '''        WM_SIZING => {
+            // WM_SIZING supplies a physical-pixel proposed rectangle. Clamp
+            // only the edge being dragged, so its opposite edge never turns
+            // into whole-window movement at a work-area boundary.
+            const MONITOR_DEFAULTTONEAREST: u32 = 2;
+            unsafe {
+                let hmon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+                if hmon != 0 && lparam != 0 {
+                    let mut mi = MonitorInfo {
+                        cb_size: std::mem::size_of::<MonitorInfo>() as u32,
+                        rc_monitor: WinRect::default(),
+                        rc_work: WinRect::default(),
+                        dw_flags: 0,
+                    };
+                    if GetMonitorInfoW(hmon, &mut mi) != 0 {
+                        let rect = &mut *(lparam as *mut WinRect);
+                        match wparam {
+                            1 | 4 | 7 if rect.left < mi.rc_work.left => rect.left = mi.rc_work.left,
+                            2 | 5 | 8 if rect.right > mi.rc_work.right => {
+                                rect.right = mi.rc_work.right
+                            }
+                            _ => {}
+                        }
+                        match wparam {
+                            3 | 4 | 5 if rect.top < mi.rc_work.top => rect.top = mi.rc_work.top,
+                            6 | 7 | 8 if rect.bottom > mi.rc_work.bottom => {
+                                rect.bottom = mi.rc_work.bottom
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            1
+        }
+        WM_GETMINMAXINFO => {''',
+        "dwm preserve opposite resize edge",
     )
 
 
@@ -218,6 +330,19 @@ def patch_window_commands(source: Path) -> None:
         '}\n',
         "flyout pin commands",
     )
+    replace_once(
+        path,
+        '#[tauri::command]\npub fn set_flyout_interacting(active: bool) {\n'
+        '    crate::shell::flyout_window::set_interacting(active);\n'
+        '}',
+        '#[tauri::command]\npub fn set_flyout_interacting(app: tauri::AppHandle, active: bool) {\n'
+        '    crate::shell::flyout_window::set_interacting(active);\n'
+        '    if !active {\n'
+        '        crate::shell::flyout_window::keep_inside_work_area(&app);\n'
+        '    }\n'
+        '}',
+        "flyout correction after title drag",
+    )
 
 
 def patch_main(source: Path) -> None:
@@ -267,48 +392,44 @@ def patch_main(source: Path) -> None:
 def patch_notification_controller(source: Path) -> None:
     path = source / "apps/desktop-tauri/src-tauri/src/notification_controller.rs"
     insert_before = '''    fn dispatch(\n        &mut self,\n        settings: &AppSettings,\n        events: Vec<V1NotificationEvent>,\n    ) -> Result<(), String> {'''
-    method = '''    pub fn send_task_completion(\n        &mut self,\n        repository: &SettingsRepository,\n        task_title: &str,\n        duration: Duration,\n    ) -> Result<(), String> {\n        let settings = load_settings(repository)?;\n        // Completion alerts are a Plus convenience, matching Codexstar's\n        // default long-task ding. The existing play-sound preference still\n        // controls whether the Windows toast is audible.\n        let zh = use_chinese(&settings);\n        let minutes = (duration.as_secs() + 59) / 60;\n        let title = if zh {\n            "Codex 任务已完成"\n        } else {\n            "Codex task completed"\n        };\n        let body = if zh {\n            format!("{task_title}（约 {minutes} 分钟）")\n        } else {\n            format!("{task_title} (~{minutes} min)")\n        };\n        self.sink\n            .send(title, &body, settings.notifications.play_sound)\n            .map_err(|error| map_sink_error(error, "NOTIFICATION_TASK_COMPLETION_FAILED"))\n    }\n\n'''
+    method = '''    pub fn send_task_completion(\n        &mut self,\n        repository: &SettingsRepository,\n        task_title: &str,\n        duration: Duration,\n    ) -> Result<(), String> {\n        let settings = load_settings(repository)?;\n        if !automatic_notifications_enabled(&settings) {\n            return Ok(());\n        }\n        // Sound remains independent from whether the automatic toast is sent.\n        let zh = use_chinese(&settings);\n        let minutes = (duration.as_secs() + 59) / 60;\n        let title = if zh {\n            "Codex 任务已完成"\n        } else {\n            "Codex task completed"\n        };\n        let body = if zh {\n            format!("{task_title}（约 {minutes} 分钟）")\n        } else {\n            format!("{task_title} (~{minutes} min)")\n        };\n        self.sink\n            .send(title, &body, settings.notifications.play_sound)\n            .map_err(|error| map_sink_error(error, "NOTIFICATION_TASK_COMPLETION_FAILED"))\n    }\n\n'''
     replace_once(path, insert_before, method + insert_before, "task completion notification")
+    replace_once(
+        path,
+        '''    ) -> Result<(), String> {
+        for event in events {''',
+        '''    ) -> Result<(), String> {
+        if !automatic_notifications_enabled(settings) {
+            return Ok(());
+        }
+        for event in events {''',
+        "automatic notification master guard",
+    )
+    append_once(
+        path,
+        "mod plus_master_switch_tests",
+        r'''fn automatic_notifications_enabled(settings: &AppSettings) -> bool {
+    settings.notifications.enabled
+}
+
+#[cfg(test)]
+mod plus_master_switch_tests {
+    use super::automatic_notifications_enabled;
+    use codexbar::storage::AppSettings;
+
+    #[test]
+    fn automatic_notifications_follow_master_switch() {
+        let mut settings = AppSettings::default();
+        assert!(!automatic_notifications_enabled(&settings));
+        settings.notifications.enabled = true;
+        assert!(automatic_notifications_enabled(&settings));
+    }
+}''',
+    )
 
     weekly_arm = '''        V1NotificationEvent::WeeklyReset => (\n            if zh {\n                "每周额度已重置"\n            } else {\n                "Weekly allowance reset"\n            }\n            .to_string(),'''
     five_then_weekly = '''        V1NotificationEvent::FiveHourReset => (\n            if zh {\n                "5 小时额度已重置"\n            } else {\n                "5-hour allowance reset"\n            }\n            .to_string(),\n            if zh {\n                "5 小时额度已进入新的周期。".to_string()\n            } else {\n                "The 5-hour allowance started a new cycle.".to_string()\n            },\n        ),\n        V1NotificationEvent::WeeklyReset => (\n            if zh {\n                "每周额度已重置"\n            } else {\n                "Weekly allowance reset"\n            }\n            .to_string(),'''
     replace_once(path, weekly_arm, five_then_weekly, "five-hour reset copy")
-
-
-def patch_notification_tab(source: Path) -> None:
-    path = source / "apps/desktop-tauri/src/surfaces/settings/tabs/NotificationsTab.tsx"
-    text = path.read_text(encoding="utf-8-sig")
-    # In Plus, quota-cycle reset alerts are a standalone convenience rather
-    # than being suppressed by the upstream master switch. Keep this one
-    # switch (and its sound control) usable when the master switch is off.
-    old = '''        <NotificationSwitch
-          label={copy.notifications.weeklyReset}
-          checked={notifications.weeklyResetEnabled}
-          disabled={!notifications.enabled}
-          onChange={(value) => saveBoolean("weeklyResetEnabled", value)}
-        />'''
-    new = '''        <NotificationSwitch
-          label={copy.notifications.weeklyReset}
-          checked={notifications.weeklyResetEnabled}
-          onChange={(value) => saveBoolean("weeklyResetEnabled", value)}
-        />'''
-    if text.count(old) != 1:
-        raise RuntimeError("notification tab: weekly reset switch baseline changed")
-    text = text.replace(old, new, 1)
-    old = '''        <NotificationSwitch
-          label={copy.notifications.playSound}
-          checked={notifications.playSound}
-          disabled={!notifications.enabled}
-          onChange={(value) => saveBoolean("playSound", value)}
-        />'''
-    new = '''        <NotificationSwitch
-          label={copy.notifications.playSound}
-          checked={notifications.playSound}
-          onChange={(value) => saveBoolean("playSound", value)}
-        />'''
-    if text.count(old) != 1:
-        raise RuntimeError("notification tab: sound switch baseline changed")
-    path.write_text(text.replace(old, new, 1), encoding="utf-8")
 
 
 def patch_notification_labels(source: Path) -> None:
@@ -328,36 +449,316 @@ def patch_notification_labels(source: Path) -> None:
     path.write_text(text, encoding="utf-8")
 
 
-def patch_taskbar_css(source: Path) -> None:
-    path = source / "apps/desktop-tauri/src/surfaces/TaskbarStatus.css"
-    # The Plus capsule renders up to six inline segments (avatar, 5H metric,
-    # 5H reset clock, divider, weekly metric, weekly reset date). Switch the
-    # main button to a column-flow grid so every segment stays on a single
-    # row; the hidden measurement window still reports the real width to the
-    # Win32 sizing code, which clamps it to the original taskbar bounds.
+def patch_freshness_setting(source: Path) -> None:
+    """The timestamp now has one fixed meaning and location in the header.
+    Keep the persisted legacy field readable, but remove its obsolete toggle."""
+    path = source / "apps/desktop-tauri/src/surfaces/settings/tabs/MenuTab.tsx"
     replace_once(
         path,
-        "  grid-template-columns: max-content max-content minmax(0, auto) max-content;\n",
-        "  grid-auto-flow: column;\n"
-        "  grid-auto-columns: max-content;\n",
-        "taskbar main single-row grid",
+        '''            <PanelToggle
+              label={panelCopy.showFreshness}
+              checked={panel.showFreshness}
+              disabled={saving}
+              onChange={(value) => void commit({ showFreshness: value })}
+            />
+''',
+        '',
+        "remove obsolete freshness toggle",
     )
+    test_path = source / "apps/desktop-tauri/src/surfaces/settings/tabs/MenuTab.test.tsx"
+    replace_once(
+        test_path,
+        '''    fireEvent.click(screen.getByRole("checkbox", { name: "Show data freshness" }));
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("update_settings", {
+        patch: { panel: { showFreshness: false } },
+      }),
+    );
+''',
+        '''    expect(
+      screen.queryByRole("checkbox", { name: "Show data freshness" }),
+    ).not.toBeInTheDocument();
+''',
+        "freshness toggle test",
+    )
+
+    tray_test = source / "apps/desktop-tauri/src/surfaces/TrayPanel.test.tsx"
+    tray_test_replacements = {
+        '''      "Weekly quota",
+      "Data status",
+      "Actions",''': '''      "Weekly quota",
+      "Actions",''',
+        'name: /5-hour quota.*42% remaining/i,':
+            'name: /5-hour quota.*remaining 42%/i,',
+        '''    expect(screen.getByText(/no usage data/i)).toBeInTheDocument();
+''': '',
+        'screen.getByRole("progressbar", { name: /61% remaining/i })':
+            'screen.getByRole("progressbar", { name: /remaining 61%/i })',
+        'expect(screen.getAllByRole("region")).toHaveLength(5);':
+            'expect(screen.getAllByRole("region")).toHaveLength(4);',
+    }
+    for old, new in tray_test_replacements.items():
+        replace_once(tray_test, old, new, "tray freshness and remaining-copy test")
+    replace_once(
+        tray_test,
+        '''  it("hides the panel from the macOS-style close button without quitting", async () => {
+    renderTray();
+    await screen.findByRole("button", { name: /profile/i });
+
+    const close = await screen.findByRole("button", {
+      name: /hide panel|隐藏面板/i,
+    });
+    fireEvent.click(close);
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith("dismiss_tray_panel");
+    });
+    expect(invokeMock).not.toHaveBeenCalledWith("quit_app");
+  });
+
+''',
+        '',
+        "remove obsolete tray close-button test",
+    )
+
+    header_test = source / "apps/desktop-tauri/src/surfaces/tray/TrayHeader.test.tsx"
+    for old, new in {
+        '        productName="codex-barbar"\n        version="1.0.0"\n        profile={\n':
+            '        lastUpdatedText="Last updated: 9/9 13:17"\n'
+            '        version="1.0.0"\n        profile={\n',
+        '        productName="codex-barbar"\n        version="1.0.0"\n        profile={currentCliProfile({':
+            '        lastUpdatedText="Last updated: 9/9 13:17"\n'
+            '        version="1.0.0"\n        profile={currentCliProfile({',
+        '        productName="codex-barbar"\n        version="1.0.0"\n        profile={null}':
+            '        lastUpdatedText="Not updated yet"\n'
+            '        version="1.0.0"\n        profile={null}',
+    }.items():
+        replace_once(header_test, old, new, "tray header timestamp test prop")
+    replace_once(
+        header_test,
+        '''    const close = screen.getByRole("button", { name: /hide panel|隐藏面板/i });
+    fireEvent.click(close);
+    expect(onDismiss).toHaveBeenCalledOnce();
+''',
+        '''    expect(screen.getByText("Last updated: 9/9 13:17")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Pin" })).toBeInTheDocument();
+    expect(onDismiss).not.toHaveBeenCalled();
+''',
+        "tray header pin and timestamp assertions",
+    )
+    app_test = source / "apps/desktop-tauri/src/App.test.tsx"
+    replace_once(
+        app_test,
+        '      screen.getByRole("heading", { name: "codex-barbar" }),',
+        '      screen.getByRole("heading", { name: /尚未更新|not updated yet/i }),',
+        "app header freshness assertion",
+    )
+
+
+def patch_taskbar_five_hour_setting(source: Path) -> None:
+    settings = source / "rust/src/storage/settings_repository.rs"
+    replace_once(
+        settings,
+        '    pub taskbar_status_enabled: bool,\n    pub float_ball_enabled: bool,',
+        '    pub taskbar_status_enabled: bool,\n'
+        '    pub taskbar_show_five_hour: bool,\n'
+        '    pub float_ball_enabled: bool,',
+        "taskbar five-hour setting model",
+    )
+    replace_once(
+        settings,
+        '            taskbar_status_enabled: false,\n            float_ball_enabled: true,',
+        '            taskbar_status_enabled: false,\n'
+        '            taskbar_show_five_hour: true,\n'
+        '            float_ball_enabled: true,',
+        "taskbar five-hour default",
+    )
+    replace_once(
+        settings,
+        '    pub taskbar_status_enabled: Option<bool>,\n    pub float_ball_enabled: Option<bool>,',
+        '    pub taskbar_status_enabled: Option<bool>,\n'
+        '    pub taskbar_show_five_hour: Option<bool>,\n'
+        '    pub float_ball_enabled: Option<bool>,',
+        "taskbar five-hour settings patch",
+    )
+    replace_once(
+        settings,
+        '        if let Some(value) = patch.taskbar_status_enabled {\n'
+        '            self.taskbar_status_enabled = value;\n'
+        '        }\n'
+        '        if let Some(value) = patch.float_ball_enabled {',
+        '        if let Some(value) = patch.taskbar_status_enabled {\n'
+        '            self.taskbar_status_enabled = value;\n'
+        '        }\n'
+        '        if let Some(value) = patch.taskbar_show_five_hour {\n'
+        '            self.taskbar_show_five_hour = value;\n'
+        '        }\n'
+        '        if let Some(value) = patch.float_ball_enabled {',
+        "apply taskbar five-hour setting",
+    )
+    append_once(
+        settings,
+        "mod plus_taskbar_setting_tests",
+        r'''#[cfg(test)]
+mod plus_taskbar_setting_tests {
+    use super::AppSettings;
+
+    #[test]
+    fn missing_taskbar_five_hour_setting_defaults_to_enabled() {
+        let mut value = serde_json::to_value(AppSettings::default()).unwrap();
+        value.as_object_mut().unwrap().remove("taskbarShowFiveHour");
+        let decoded: AppSettings = serde_json::from_value(value).unwrap();
+        assert!(decoded.taskbar_show_five_hour);
+    }
+}''',
+    )
+
+    bridge = source / "apps/desktop-tauri/src-tauri/src/commands/bridge.rs"
+    replace_once(
+        bridge,
+        '    pub taskbar_status_enabled: bool,\n    pub float_ball_enabled: bool,',
+        '    pub taskbar_status_enabled: bool,\n'
+        '    pub taskbar_show_five_hour: bool,\n'
+        '    pub float_ball_enabled: bool,',
+        "bridge taskbar five-hour dto",
+    )
+    replace_once(
+        bridge,
+        '            taskbar_status_enabled: false,\n            float_ball_enabled: false,',
+        '            taskbar_status_enabled: false,\n'
+        '            taskbar_show_five_hour: true,\n'
+        '            float_ball_enabled: false,',
+        "bridge taskbar five-hour default",
+    )
+    replace_once(
+        bridge,
+        '    pub taskbar_status_enabled: Option<bool>,\n    pub float_ball_enabled: Option<bool>,',
+        '    pub taskbar_status_enabled: Option<bool>,\n'
+        '    pub taskbar_show_five_hour: Option<bool>,\n'
+        '    pub float_ball_enabled: Option<bool>,',
+        "bridge taskbar five-hour patch dto",
+    )
+    replace_once(
+        bridge,
+        '            taskbar_status_enabled: settings.taskbar_status_enabled,\n'
+        '            float_ball_enabled: settings.float_ball_enabled,',
+        '            taskbar_status_enabled: settings.taskbar_status_enabled,\n'
+        '            taskbar_show_five_hour: settings.taskbar_show_five_hour,\n'
+        '            float_ball_enabled: settings.float_ball_enabled,',
+        "bridge taskbar five-hour serialization",
+    )
+    replace_once(
+        bridge,
+        '            taskbar_status_enabled: self.taskbar_status_enabled,\n'
+        '            float_ball_enabled: self.float_ball_enabled,',
+        '            taskbar_status_enabled: self.taskbar_status_enabled,\n'
+        '            taskbar_show_five_hour: self.taskbar_show_five_hour,\n'
+        '            float_ball_enabled: self.float_ball_enabled,',
+        "bridge taskbar five-hour patch mapping",
+    )
+    settings_test = source / "apps/desktop-tauri/src-tauri/src/commands/settings.rs"
+    replace_once(
+        settings_test,
+        '            taskbar_status_enabled: Some(true),\n            float_ball_enabled: Some(false),',
+        '            taskbar_status_enabled: Some(true),\n'
+        '            taskbar_show_five_hour: Some(false),\n'
+        '            float_ball_enabled: Some(false),',
+        "settings bridge taskbar five-hour patch test input",
+    )
+    replace_once(
+        settings_test,
+        '        assert_eq!(settings.taskbar_status_enabled, Some(true));\n'
+        '        assert_eq!(settings.float_ball_enabled, Some(false));',
+        '        assert_eq!(settings.taskbar_status_enabled, Some(true));\n'
+        '        assert_eq!(settings.taskbar_show_five_hour, Some(false));\n'
+        '        assert_eq!(settings.float_ball_enabled, Some(false));',
+        "settings bridge taskbar five-hour patch test result",
+    )
+    replace_once(
+        settings_test,
+        '        assert!(!dto.taskbar_status_enabled);\n        assert!(dto.float_ball_enabled);',
+        '        assert!(!dto.taskbar_status_enabled);\n'
+        '        assert!(dto.taskbar_show_five_hour);\n'
+        '        assert!(dto.float_ball_enabled);',
+        "settings bridge taskbar five-hour dto default test",
+    )
+
+    types = source / "apps/desktop-tauri/src/types/bridge.ts"
+    replace_once(
+        types,
+        '  taskbarStatusEnabled: boolean;\n  floatBallEnabled: boolean;',
+        '  taskbarStatusEnabled: boolean;\n'
+        '  taskbarShowFiveHour?: boolean;\n'
+        '  floatBallEnabled: boolean;',
+        "typescript taskbar five-hour setting",
+    )
+    fixtures = source / "apps/desktop-tauri/src/test/profileUsageFixtures.ts"
+    replace_once(
+        fixtures,
+        '  taskbarStatusEnabled: false,\n  floatBallEnabled: false,',
+        '  taskbarStatusEnabled: false,\n'
+        '  taskbarShowFiveHour: false,\n'
+        '  floatBallEnabled: false,',
+        "frontend fixture keeps upstream taskbar mode",
+    )
+
+    copy = source / "apps/desktop-tauri/src/surfaces/settings/settingsCopy.ts"
+    replace_once(
+        copy,
+        '    taskbarEnabled: string;\n    showIcon: string;',
+        '    taskbarEnabled: string;\n    showFiveHour: string;\n    showIcon: string;',
+        "taskbar five-hour copy type",
+    )
+    replace_once(
+        copy,
+        '    taskbarEnabled: "Show taskbar status",\n    showIcon:',
+        '    taskbarEnabled: "Show taskbar status",\n'
+        '    showFiveHour: "Show 5H quota in taskbar",\n'
+        '    showIcon:',
+        "taskbar five-hour English copy",
+    )
+    replace_once(
+        copy,
+        '    taskbarEnabled: "显示任务栏状态",\n    showIcon:',
+        '    taskbarEnabled: "显示任务栏状态",\n'
+        '    showFiveHour: "任务栏显示 5H 额度",\n'
+        '    showIcon:',
+        "taskbar five-hour Chinese copy",
+    )
+
+    tab = source / "apps/desktop-tauri/src/surfaces/settings/tabs/TaskbarTrayTab.tsx"
+    replace_once(
+        tab,
+        '          <label className="settings-switch settings-switch--primary"><input type="checkbox" checked={draft.enabled} disabled={isSavingPreferences || (!draft.enabled && visibleTaskbarItems === 0)} aria-describedby="taskbar-visible-item-help" onChange={(event) => setTaskbarEnabled(event.target.checked)} />{copy.taskbarPresentation.taskbarEnabled}</label>\n'
+        '          <div className="settings-preference-grid">',
+        '          <label className="settings-switch settings-switch--primary"><input type="checkbox" checked={draft.enabled} disabled={isSavingPreferences || (!draft.enabled && visibleTaskbarItems === 0)} aria-describedby="taskbar-visible-item-help" onChange={(event) => setTaskbarEnabled(event.target.checked)} />{copy.taskbarPresentation.taskbarEnabled}</label>\n'
+        '          <label className="settings-switch"><input type="checkbox" checked={settings.taskbarShowFiveHour ?? true} disabled={isSavingPreferences} onChange={(event) => void update({ taskbarShowFiveHour: event.target.checked })} />{copy.taskbarPresentation.showFiveHour}</label>\n'
+        '          <div className="settings-preference-grid">',
+        "taskbar five-hour settings control",
+    )
+
+
+def patch_taskbar_css(source: Path) -> None:
+    path = source / "apps/desktop-tauri/src/surfaces/TaskbarStatus.css"
     append_once(
         path,
         "/* codex-barbar-plus: taskbar dual-quota single row */",
         r'''/* codex-barbar-plus: taskbar dual-quota single row */
-.taskbar-status__main {
+.taskbar-status--plus .taskbar-status__main {
+  grid-template-columns: none;
+  grid-auto-flow: column;
+  grid-auto-columns: max-content;
   white-space: nowrap;
 }
 
-.taskbar-status__divider {
+.taskbar-status--plus .taskbar-status__divider {
   color: var(--quota-unknown);
   font-weight: 700;
   line-height: 1;
 }
 
-.taskbar-status__metric,
-.taskbar-status__reset {
+.taskbar-status--plus .taskbar-status__metric,
+.taskbar-status--plus .taskbar-status__reset {
   white-space: nowrap;
 }''',
     )
@@ -573,8 +974,9 @@ def main() -> None:
     patch_window_commands(source)
     patch_main(source)
     patch_notification_controller(source)
-    patch_notification_tab(source)
     patch_notification_labels(source)
+    patch_freshness_setting(source)
+    patch_taskbar_five_hour_setting(source)
     patch_taskbar_css(source)
     patch_task_css(source)
     patch_version_branding(source, args.version)

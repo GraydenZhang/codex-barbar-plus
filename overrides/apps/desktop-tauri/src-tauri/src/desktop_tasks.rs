@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs::{self, File},
-    io::{BufRead, BufReader, Read, Seek, SeekFrom},
+    io::{BufRead, BufReader, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::Mutex,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -21,13 +21,6 @@ const MAX_BOOTSTRAP_BYTES: u64 = 768 * 1024;
 const TAIL_RECONCILE_BYTES: u64 = 160 * 1024;
 const DISCOVERY_INTERVAL_TICKS: u64 = 4;
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
-const DONE_GRACE: Duration = Duration::from_secs(45);
-const ACKNOWLEDGEMENT_DEBOUNCE: Duration = Duration::from_millis(450);
-const ERROR_RETENTION: Duration = Duration::from_secs(15 * 60);
-// Working tasks are kept only while they are still the latest active turn in
-// their session. A stale Working record is corrected by tail reconciliation
-// rather than relying on a long TTL.
-const WORKING_RETENTION: Duration = Duration::from_secs(30 * 60);
 const COMPLETION_SOUND_MINIMUM: Duration = Duration::from_secs(3 * 60);
 const RECENT_FILE_WINDOW: Duration = Duration::from_secs(15);
 
@@ -71,8 +64,6 @@ struct TaskRecord {
     started_at: DateTime<Utc>,
     finished_at: Option<DateTime<Utc>>,
     duration: Option<Duration>,
-    was_unread: bool,
-    unread_cleared_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Default)]
@@ -80,9 +71,12 @@ struct RuntimeState {
     tasks: HashMap<String, TaskRecord>,
     active_turn_by_thread: HashMap<String, String>,
     thread_titles: HashMap<String, String>,
+    indexed_title_threads: HashSet<String>,
+    thread_id_by_file: HashMap<PathBuf, String>,
+    ignored_files: HashSet<PathBuf>,
     file_offsets: HashMap<PathBuf, u64>,
     known_files: HashSet<PathBuf>,
-    unread_threads: HashSet<String>,
+    notified_turns: HashSet<String>,
     tick: u64,
 }
 
@@ -101,17 +95,23 @@ pub fn start(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         let codex_root = codex_root();
         let sessions_root = codex_root.join("sessions");
-        let global_state = codex_root.join(".codex-global-state.json");
         let session_index = codex_root.join("session_index.jsonl");
         let mut runtime = RuntimeState::default();
 
         loop {
             runtime.tick = runtime.tick.wrapping_add(1);
             if runtime.tick == 1 || runtime.tick % DISCOVERY_INTERVAL_TICKS == 0 {
-                runtime.unread_threads = read_unread_threads(&global_state);
                 let index_titles = read_session_index_titles(&session_index);
                 for (thread_id, title) in index_titles {
-                    runtime.thread_titles.insert(thread_id, title);
+                    runtime
+                        .thread_titles
+                        .insert(thread_id.clone(), title.clone());
+                    runtime.indexed_title_threads.insert(thread_id.clone());
+                    for task in runtime.tasks.values_mut() {
+                        if task.thread_id == thread_id {
+                            task.title = title.clone();
+                        }
+                    }
                 }
                 discover_session_files(&sessions_root, &mut runtime);
             }
@@ -186,11 +186,12 @@ fn read_session_index_titles(path: &Path) -> HashMap<String, String> {
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
-        let Some(thread_id) = value
-            .get("thread_id")
-            .and_then(Value::as_str)
-            .or_else(|| value.get("threadId").and_then(Value::as_str))
-        else {
+        let Some(thread_id) = value.get("id").and_then(Value::as_str).or_else(|| {
+            value
+                .get("thread_id")
+                .and_then(Value::as_str)
+                .or_else(|| value.get("threadId").and_then(Value::as_str))
+        }) else {
             continue;
         };
         let title = value
@@ -206,6 +207,17 @@ fn read_session_index_titles(path: &Path) -> HashMap<String, String> {
 }
 
 fn bootstrap_file(runtime: &mut RuntimeState, path: &Path) {
+    let Some((thread_id, is_subagent)) = read_session_metadata(path) else {
+        runtime.ignored_files.insert(path.to_path_buf());
+        return;
+    };
+    if is_subagent {
+        runtime.ignored_files.insert(path.to_path_buf());
+        return;
+    }
+    runtime
+        .thread_id_by_file
+        .insert(path.to_path_buf(), thread_id);
     let Ok(mut file) = File::open(path) else {
         return;
     };
@@ -233,6 +245,9 @@ fn bootstrap_file(runtime: &mut RuntimeState, path: &Path) {
 fn process_known_files(app: &AppHandle, runtime: &mut RuntimeState) {
     let paths: Vec<PathBuf> = runtime.known_files.iter().cloned().collect();
     for path in paths {
+        if runtime.ignored_files.contains(&path) {
+            continue;
+        }
         let offset = runtime.file_offsets.get(&path).copied().unwrap_or(0);
         let Ok(mut file) = File::open(&path) else {
             continue;
@@ -244,7 +259,12 @@ fn process_known_files(app: &AppHandle, runtime: &mut RuntimeState) {
         if len < offset {
             runtime.file_offsets.insert(path.clone(), 0);
         }
-        let start = runtime.file_offsets.get(&path).copied().unwrap_or(0).min(len);
+        let start = runtime
+            .file_offsets
+            .get(&path)
+            .copied()
+            .unwrap_or(0)
+            .min(len);
         if file.seek(SeekFrom::Start(start)).is_err() {
             continue;
         }
@@ -320,7 +340,7 @@ fn reconcile_file_tail(runtime: &mut RuntimeState, path: &Path) {
                 task.status = status;
                 task.finished_at = Some(ts);
                 task.duration = (ts - task.started_at).to_std().ok().or(task.duration);
-                if task.status == TaskStatus::Completed {
+                if task.status != TaskStatus::Working {
                     runtime.active_turn_by_thread.remove(&task.thread_id);
                 }
             }
@@ -341,10 +361,7 @@ fn lifecycle_event(line: &str) -> Option<(String, TaskStatus, DateTime<Utc>)> {
     let Some(event_type) = payload.get("type").and_then(Value::as_str) else {
         return None;
     };
-    let turn_id = payload
-        .get("turn_id")
-        .and_then(Value::as_str)?
-        .to_string();
+    let turn_id = payload.get("turn_id").and_then(Value::as_str)?.to_string();
     let timestamp = parse_timestamp(value.get("timestamp")).unwrap_or_else(Utc::now);
     let status = match event_type {
         "task_started" => TaskStatus::Working,
@@ -375,7 +392,12 @@ fn process_line(
         return;
     };
     let timestamp = parse_timestamp(value.get("timestamp")).unwrap_or_else(Utc::now);
-    let thread_id = thread_id_from_path(path).unwrap_or_else(|| "unknown".to_string());
+    let thread_id = runtime
+        .thread_id_by_file
+        .get(path)
+        .cloned()
+        .or_else(|| thread_id_from_path(path))
+        .unwrap_or_else(|| "unknown".to_string());
 
     match event_type {
         "user_message" => {
@@ -383,12 +405,21 @@ fn process_line(
                 .get("message")
                 .and_then(Value::as_str)
                 .or_else(|| payload.get("text").and_then(Value::as_str));
-            if let Some(title) = message.and_then(clean_title) {
-                runtime.thread_titles.insert(thread_id.clone(), title.clone());
+            if !runtime.indexed_title_threads.contains(&thread_id)
+                && let Some(title) = message.and_then(clean_title)
+            {
+                runtime
+                    .thread_titles
+                    .entry(thread_id.clone())
+                    .or_insert_with(|| title.clone());
                 if let Some(turn_id) = runtime.active_turn_by_thread.get(&thread_id).cloned()
                     && let Some(task) = runtime.tasks.get_mut(&turn_id)
                 {
-                    task.title = title;
+                    task.title = runtime
+                        .thread_titles
+                        .get(&thread_id)
+                        .cloned()
+                        .unwrap_or(title);
                 }
             }
         }
@@ -413,7 +444,9 @@ fn process_line(
                     task.duration = (started_at - task.started_at).to_std().ok();
                 }
             }
-            runtime.active_turn_by_thread.insert(thread_id.clone(), turn_id.to_string());
+            runtime
+                .active_turn_by_thread
+                .insert(thread_id.clone(), turn_id.to_string());
             runtime.tasks.insert(
                 turn_id.to_string(),
                 TaskRecord {
@@ -424,8 +457,6 @@ fn process_line(
                     started_at,
                     finished_at: None,
                     duration: None,
-                    was_unread: false,
-                    unread_cleared_at: None,
                 },
             );
         }
@@ -443,38 +474,32 @@ fn process_line(
                 .and_then(|seconds| Utc.timestamp_opt(seconds, 0).single())
                 .unwrap_or(timestamp);
             let fallback_title = resolve_title(runtime, &thread_id);
-            let task = runtime.tasks.entry(turn_id.to_string()).or_insert_with(|| TaskRecord {
-                turn_id: turn_id.to_string(),
-                thread_id: thread_id.clone(),
-                title: fallback_title,
-                status: TaskStatus::Completed,
-                started_at: duration
-                    .and_then(|value| chrono::Duration::from_std(value).ok())
-                    .map(|value| completed_at - value)
-                    .unwrap_or(completed_at),
-                finished_at: Some(completed_at),
-                duration,
-                was_unread: false,
-                unread_cleared_at: None,
-            });
+            let task = runtime
+                .tasks
+                .entry(turn_id.to_string())
+                .or_insert_with(|| TaskRecord {
+                    turn_id: turn_id.to_string(),
+                    thread_id: thread_id.clone(),
+                    title: fallback_title,
+                    status: TaskStatus::Completed,
+                    started_at: duration
+                        .and_then(|value| chrono::Duration::from_std(value).ok())
+                        .map(|value| completed_at - value)
+                        .unwrap_or(completed_at),
+                    finished_at: Some(completed_at),
+                    duration,
+                });
             task.status = TaskStatus::Completed;
             task.finished_at = Some(completed_at);
-            task.duration = duration.or_else(|| {
-                (completed_at - task.started_at)
-                    .to_std()
-                    .ok()
-            });
-            if runtime.unread_threads.contains(&thread_id) {
-                task.was_unread = true;
-                task.unread_cleared_at = None;
-            }
+            task.duration = duration.or_else(|| (completed_at - task.started_at).to_std().ok());
             runtime.active_turn_by_thread.remove(&thread_id);
 
-            if live
-                && task.duration.is_some_and(|value| value >= COMPLETION_SOUND_MINIMUM)
+            let notify_duration = task.duration;
+            let notify_title = task.title.clone();
+            if should_notify_completion(runtime, turn_id, live, notify_duration)
                 && let Some(app) = app
             {
-                notify_completion(app, &task.title, task.duration);
+                notify_completion(app, &notify_title, notify_duration);
             }
         }
         "turn_aborted" | "turn_failed" | "task_failed" => {
@@ -498,8 +523,6 @@ fn process_line(
                         started_at: timestamp,
                         finished_at: Some(timestamp),
                         duration: Some(Duration::ZERO),
-                        was_unread: false,
-                        unread_cleared_at: None,
                     },
                 );
             }
@@ -544,79 +567,75 @@ fn notify_completion(app: &AppHandle, title: &str, duration: Option<Duration>) {
         >,
     >>();
     if let Ok(mut controller) = controller.lock()
-        && let Err(error) = controller.send_task_completion(
-            &repository,
-            title,
-            duration.unwrap_or(Duration::ZERO),
-        )
+        && let Err(error) =
+            controller.send_task_completion(&repository, title, duration.unwrap_or(Duration::ZERO))
     {
         tracing::warn!(error = %error, "Codex Desktop completion notification failed");
     }
 }
 
-fn read_unread_threads(path: &Path) -> HashSet<String> {
-    let Ok(mut file) = File::open(path) else {
-        return HashSet::new();
-    };
-    let mut text = String::new();
-    if file.read_to_string(&mut text).is_err() {
-        return HashSet::new();
+fn should_notify_completion(
+    runtime: &mut RuntimeState,
+    turn_id: &str,
+    live: bool,
+    duration: Option<Duration>,
+) -> bool {
+    live && duration.is_some_and(|value| value >= COMPLETION_SOUND_MINIMUM)
+        && runtime.notified_turns.insert(turn_id.to_string())
+}
+
+fn read_session_metadata(path: &Path) -> Option<(String, bool)> {
+    let file = File::open(path).ok()?;
+    let line = BufReader::new(file).lines().next()?.ok()?;
+    let value = serde_json::from_str::<Value>(&line).ok()?;
+    if value.get("type").and_then(Value::as_str) != Some("session_meta") {
+        return None;
     }
-    let Ok(value) = serde_json::from_str::<Value>(&text) else {
-        return HashSet::new();
-    };
-    value
-        .get("electron-persisted-atom-state")
-        .and_then(|value| value.get("unread-thread-ids-by-host-v1"))
-        .and_then(|value| value.get("local"))
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
+    let payload = value.get("payload")?;
+    let thread_id = payload
+        .get("id")
+        .and_then(Value::as_str)
+        .or_else(|| payload.get("session_id").and_then(Value::as_str))?;
+    Uuid::parse_str(thread_id).ok()?;
+    let is_subagent = payload.get("thread_source").and_then(Value::as_str) == Some("subagent")
+        || payload
+            .get("parent_thread_id")
+            .and_then(Value::as_str)
+            .is_some()
+        || payload
+            .get("agent_nickname")
+            .and_then(Value::as_str)
+            .is_some();
+    Some((thread_id.to_string(), is_subagent))
 }
 
 fn prune_tasks(runtime: &mut RuntimeState) {
-    let now = Utc::now();
-    let unread = runtime.unread_threads.clone();
-    runtime.tasks.retain(|_, task| match task.status {
-        TaskStatus::Working => (now - task.started_at)
-            .to_std()
-            .map(|age| age <= WORKING_RETENTION)
-            .unwrap_or(true),
-        TaskStatus::Error => task
-            .finished_at
-            .and_then(|finished| (now - finished).to_std().ok())
-            .map(|age| age <= ERROR_RETENTION)
-            .unwrap_or(true),
-        TaskStatus::Completed => {
-            let is_unread = unread.contains(&task.thread_id);
-            if is_unread {
-                task.was_unread = true;
-                task.unread_cleared_at = None;
-                true
-            } else if task.was_unread {
-                let cleared_at = task.unread_cleared_at.get_or_insert(now);
-                (now - *cleared_at)
-                    .to_std()
-                    .map(|age| age <= ACKNOWLEDGEMENT_DEBOUNCE)
-                    .unwrap_or(true)
-            } else {
-                task.finished_at
-                    .and_then(|finished| (now - finished).to_std().ok())
-                    .map(|age| age <= DONE_GRACE)
-                    .unwrap_or(false)
-            }
-        }
+    // Codex's persisted unread set is not a reliable acknowledgement signal;
+    // it can retain old completed subagent turns indefinitely. Only expose
+    // turns whose latest lifecycle event still proves that they are running.
+    runtime.tasks.retain(|turn_id, task| {
+        task.status == TaskStatus::Working
+            && runtime.active_turn_by_thread.get(&task.thread_id) == Some(turn_id)
     });
 }
 
 fn publish_snapshot(app: &AppHandle, runtime: &RuntimeState) {
-    let mut tasks: Vec<&TaskRecord> = runtime.tasks.values().collect();
+    let mut latest_by_thread: HashMap<&str, &TaskRecord> = HashMap::new();
+    for task in runtime
+        .tasks
+        .values()
+        .filter(|task| task.status == TaskStatus::Working)
+    {
+        latest_by_thread
+            .entry(&task.thread_id)
+            .and_modify(|current| {
+                if task.started_at > current.started_at {
+                    *current = task;
+                }
+            })
+            .or_insert(task);
+    }
+    let mut tasks: Vec<&TaskRecord> = latest_by_thread.into_values().collect();
     tasks.sort_by(|left, right| {
         status_rank(left.status)
             .cmp(&status_rank(right.status))
@@ -681,16 +700,138 @@ fn thread_id_from_path(path: &Path) -> Option<String> {
         return None;
     }
     let candidate = &stem[stem.len() - 36..];
-    Uuid::parse_str(candidate).ok().map(|value| value.to_string())
+    Uuid::parse_str(candidate)
+        .ok()
+        .map(|value| value.to_string())
 }
 
 fn clean_title(value: &str) -> Option<String> {
-    let collapsed = value
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let collapsed = value.split_whitespace().collect::<Vec<_>>().join(" ");
     if collapsed.is_empty() {
         return None;
     }
     Some(collapsed.chars().take(72).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn temp_file(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("codexbar-{name}-{}.jsonl", Uuid::new_v4()))
+    }
+
+    fn write_file(path: &Path, text: &str) {
+        let mut file = File::create(path).unwrap();
+        file.write_all(text.as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn session_index_accepts_current_id_field_and_skips_bad_lines() {
+        let path = temp_file("session-index");
+        write_file(
+            &path,
+            "{not-json}\n{\"id\":\"thread-a\",\"thread_name\":\"Official title\"}\n",
+        );
+        assert_eq!(
+            read_session_index_titles(&path)
+                .get("thread-a")
+                .map(String::as_str),
+            Some("Official title")
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn session_metadata_filters_subagents_without_reading_chat_content() {
+        let path = temp_file("session-meta");
+        let id = Uuid::new_v4();
+        write_file(
+            &path,
+            &format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"thread_source\":\"subagent\"}}}}\n"
+            ),
+        );
+        assert_eq!(read_session_metadata(&path), Some((id.to_string(), true)));
+        write_file(&path, "{\"type\":\"session_meta\",\"payload\":{}}\n");
+        assert_eq!(read_session_metadata(&path), None);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn pruning_keeps_a_proven_long_running_turn_without_a_time_limit() {
+        let thread_id = Uuid::new_v4().to_string();
+        let turn_id = "turn-long".to_string();
+        let mut runtime = RuntimeState::default();
+        runtime
+            .active_turn_by_thread
+            .insert(thread_id.clone(), turn_id.clone());
+        runtime.tasks.insert(
+            turn_id.clone(),
+            TaskRecord {
+                turn_id,
+                thread_id,
+                title: "Long task".to_string(),
+                status: TaskStatus::Working,
+                started_at: Utc::now() - chrono::Duration::hours(8),
+                finished_at: None,
+                duration: None,
+            },
+        );
+        prune_tasks(&mut runtime);
+        assert_eq!(runtime.tasks.len(), 1);
+    }
+
+    #[test]
+    fn pruning_drops_completed_and_superseded_turns() {
+        let thread_id = Uuid::new_v4().to_string();
+        let mut runtime = RuntimeState::default();
+        runtime
+            .active_turn_by_thread
+            .insert(thread_id.clone(), "new".to_string());
+        for (turn_id, status) in [
+            ("old", TaskStatus::Working),
+            ("done", TaskStatus::Completed),
+        ] {
+            runtime.tasks.insert(
+                turn_id.to_string(),
+                TaskRecord {
+                    turn_id: turn_id.to_string(),
+                    thread_id: thread_id.clone(),
+                    title: "Task".to_string(),
+                    status,
+                    started_at: Utc::now(),
+                    finished_at: None,
+                    duration: None,
+                },
+            );
+        }
+        prune_tasks(&mut runtime);
+        assert!(runtime.tasks.is_empty());
+    }
+
+    #[test]
+    fn completion_notification_is_deduplicated_per_turn() {
+        let mut runtime = RuntimeState::default();
+        let duration = Some(COMPLETION_SOUND_MINIMUM);
+        assert!(should_notify_completion(
+            &mut runtime,
+            "turn-1",
+            true,
+            duration
+        ));
+        assert!(!should_notify_completion(
+            &mut runtime,
+            "turn-1",
+            true,
+            duration
+        ));
+        assert!(!should_notify_completion(
+            &mut runtime,
+            "turn-2",
+            false,
+            duration
+        ));
+    }
 }

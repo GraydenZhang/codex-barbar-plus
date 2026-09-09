@@ -6,7 +6,7 @@ import AccountAvatar from "../../components/AccountAvatar";
 import type { TrayCopy } from "./copy";
 
 interface TrayHeaderProps {
-  productName: string;
+  lastUpdatedText: string;
   version: string;
   profile: ProfileSummaryDto | null;
   copy: TrayCopy;
@@ -19,7 +19,7 @@ interface TrayHeaderProps {
 }
 
 export default function TrayHeader({
-  productName,
+  lastUpdatedText,
   version,
   profile,
   copy,
@@ -64,7 +64,7 @@ export default function TrayHeader({
         </span>
         <div className="tray-panel__title-group">
           <p className="tray-panel__identity-name">{identity}</p>
-          <h1>{productName}</h1>
+          <h1>{lastUpdatedText}</h1>
           {showAccountStatus ? (
             <p className="tray-panel__identity-status">{secondary}</p>
           ) : null}

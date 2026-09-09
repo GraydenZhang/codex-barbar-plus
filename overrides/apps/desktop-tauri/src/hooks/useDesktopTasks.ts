@@ -24,6 +24,18 @@ const EMPTY: DesktopTaskSnapshotDto = {
   updatedAt: null,
 };
 
+function isDesktopTaskSnapshot(value: unknown): value is DesktopTaskSnapshotDto {
+  if (!value || typeof value !== "object") return false;
+  const snapshot = value as Partial<DesktopTaskSnapshotDto>;
+  return Array.isArray(snapshot.tasks) && snapshot.tasks.every((task) =>
+    Boolean(task) &&
+    typeof task.id === "string" &&
+    typeof task.threadId === "string" &&
+    typeof task.title === "string" &&
+    ["working", "completed", "error"].includes(task.status),
+  );
+}
+
 export function useDesktopTasks(): DesktopTaskSnapshotDto {
   const [snapshot, setSnapshot] = useState<DesktopTaskSnapshotDto>(EMPTY);
 
@@ -33,14 +45,14 @@ export function useDesktopTasks(): DesktopTaskSnapshotDto {
 
     void getDesktopTaskSnapshot()
       .then((next) => {
-        if (active) setSnapshot(next);
+        if (active && isDesktopTaskSnapshot(next)) setSnapshot(next);
       })
       .catch(() => {});
 
     void listen<DesktopTaskSnapshotDto>(
       "desktop-task-state-changed",
       (event) => {
-        if (active) setSnapshot(event.payload);
+        if (active && isDesktopTaskSnapshot(event.payload)) setSnapshot(event.payload);
       },
     )
       .then((nextUnlisten) => {
