@@ -1,0 +1,1723 @@
+--- a/apps/desktop-tauri/src-tauri/capabilities/default.json
++++ b/apps/desktop-tauri/src-tauri/capabilities/default.json
+@@ -1,9 +1,10 @@
+ {
+   "identifier": "default",
+   "description": "V1 codex-barbar desktop: tray panel + settings windows, core event only.",
+-  "windows": ["main", "settings", "taskbar-status", "taskbar-status-measure", "float-ball"],
++  "windows": ["main", "settings", "taskbar-status", "float-ball"],
+   "permissions": [
+     "core:event:allow-listen",
++    "core:window:allow-is-visible",
+     "core:event:allow-unlisten",
+     "core:window:allow-start-dragging"
+   ]
+--- a/apps/desktop-tauri/src-tauri/src/commands/window.rs
++++ b/apps/desktop-tauri/src-tauri/src/commands/window.rs
+@@ -17,7 +17,7 @@
+ }
+ 
+ #[tauri::command]
+-pub fn close_settings_window(
++pub async fn close_settings_window(
+     app: tauri::AppHandle,
+     window: tauri::WebviewWindow,
+ ) -> Result<(), String> {
+--- a/apps/desktop-tauri/src-tauri/src/desktop_tasks.rs
++++ b/apps/desktop-tauri/src-tauri/src/desktop_tasks.rs
+@@ -272,7 +272,9 @@
+         || start + tail_end as u64,
+         |(_, committed_end)| committed_end,
+     );
+-    runtime.file_offsets.insert(path.to_path_buf(), committed_end);
++    runtime
++        .file_offsets
++        .insert(path.to_path_buf(), committed_end);
+     prune_tasks(runtime);
+ }
+ 
+@@ -392,7 +394,10 @@
+         let bytes = &mut block[..(block_end - block_start) as usize];
+         file.seek(SeekFrom::Start(block_start))?;
+         file.read_exact(bytes)?;
+-        for index in (0..bytes.len()).rev().filter(|index| bytes[*index] == b'\n') {
++        for index in (0..bytes.len())
++            .rev()
++            .filter(|index| bytes[*index] == b'\n')
++        {
+             let next_line_start = block_start + index as u64 + 1;
+             if let Some(end) = line_end {
+                 let event: Option<LifecycleProjection> = if end <= block_end {
+@@ -414,7 +419,10 @@
+     if let Some(end) = line_end {
+         file.seek(SeekFrom::Start(0))?;
+         let event = read_lifecycle_projection(file.take(end))?;
+-        return Ok((event.and_then(LifecycleProjection::into_lifecycle), committed_end));
++        return Ok((
++            event.and_then(LifecycleProjection::into_lifecycle),
++            committed_end,
++        ));
+     }
+     Ok((None, committed_end))
+ }
+@@ -475,9 +483,7 @@
+     let mut line = String::new();
+     loop {
+         line.clear();
+-        if !matches!(reader.read_line(&mut line), Ok(read) if read > 0)
+-            || !line.ends_with('\n')
+-        {
++        if !matches!(reader.read_line(&mut line), Ok(read) if read > 0) || !line.ends_with('\n') {
+             break;
+         }
+         if let Some((turn_id, status, ts)) = lifecycle_event(&line) {
+@@ -785,13 +791,25 @@
+         return SessionMetadata::Ignored;
+     };
+     if payload.thread_source.as_ref().and_then(Value::as_str) == Some("subagent")
+-        || payload.parent_thread_id.as_ref().and_then(Value::as_str).is_some()
+-        || payload.agent_nickname.as_ref().and_then(Value::as_str).is_some()
++        || payload
++            .parent_thread_id
++            .as_ref()
++            .and_then(Value::as_str)
++            .is_some()
++        || payload
++            .agent_nickname
++            .as_ref()
++            .and_then(Value::as_str)
++            .is_some()
+     {
+         return SessionMetadata::Ignored;
+     }
+-    let Some(thread_id) = payload.id.as_ref().and_then(Value::as_str)
+-        .or_else(|| payload.session_id.as_ref().and_then(Value::as_str)) else {
++    let Some(thread_id) = payload
++        .id
++        .as_ref()
++        .and_then(Value::as_str)
++        .or_else(|| payload.session_id.as_ref().and_then(Value::as_str))
++    else {
+         return SessionMetadata::Ignored;
+     };
+     if Uuid::parse_str(&thread_id).is_err() {
+@@ -940,7 +958,10 @@
+     fn output_line(bytes: usize) -> String {
+         let prefix = "{\"type\":\"response_item\",\"payload\":{\"output\":\"";
+         let suffix = "\"}}\n";
+-        format!("{prefix}{}{suffix}", "x".repeat(bytes - prefix.len() - suffix.len()))
++        format!(
++            "{prefix}{}{suffix}",
++            "x".repeat(bytes - prefix.len() - suffix.len())
++        )
+     }
+ 
+     #[test]
+@@ -985,7 +1006,12 @@
+         let output_bytes = RECOVERY_BLOCK_BYTES as usize * 14 - event.len().div_ceil(2);
+         write_file(
+             &path,
+-            &format!("{}{}{}", session_header(&thread_id), event, output_line(output_bytes)),
++            &format!(
++                "{}{}{}",
++                session_header(&thread_id),
++                event,
++                output_line(output_bytes)
++            ),
+         );
+         let mut runtime = RuntimeState::default();
+         bootstrap_file(&mut runtime, &path);
+@@ -1008,7 +1034,13 @@
+ 
+     #[test]
+     fn bootstrap_does_not_resurrect_a_terminal_turn_hidden_before_long_output() {
+-        for terminal in ["task_complete", "turn_completed", "turn_aborted", "turn_failed", "task_failed"] {
++        for terminal in [
++            "task_complete",
++            "turn_completed",
++            "turn_aborted",
++            "turn_failed",
++            "task_failed",
++        ] {
+             let path = temp_file("terminal-bootstrap");
+             write_file(
+                 &path,
+@@ -1050,7 +1082,10 @@
+         let mut runtime = RuntimeState::default();
+         bootstrap_file(&mut runtime, &path);
+         assert!(runtime.tasks.is_empty());
+-        assert_eq!(runtime.file_offsets[&path], fs::metadata(&path).unwrap().len());
++        assert_eq!(
++            runtime.file_offsets[&path],
++            fs::metadata(&path).unwrap().len()
++        );
+         let _ = fs::remove_file(path);
+     }
+ 
+@@ -1070,7 +1105,11 @@
+         assert!(runtime.tasks.is_empty());
+         append_file(
+             &path,
+-            &format!("{}{}", &header[header.len() / 2..], task_event("task_started", "late-turn")),
++            &format!(
++                "{}{}",
++                &header[header.len() / 2..],
++                task_event("task_started", "late-turn")
++            ),
+         );
+         process_file_updates(&mut runtime, &path, None);
+         assert_eq!(runtime.tasks["late-turn"].thread_id, thread_id);
+@@ -1099,7 +1138,10 @@
+     #[test]
+     fn confirmed_subagents_and_unrelated_files_are_not_retried() {
+         for header in [
+-            format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{}\",\"thread_source\":\"subagent\"}}}}\n", Uuid::new_v4()),
++            format!(
++                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{}\",\"thread_source\":\"subagent\"}}}}\n",
++                Uuid::new_v4()
++            ),
+             "{\"type\":\"unrelated\",\"payload\":{}}\n".to_string(),
+         ] {
+             let path = temp_file("ignored-session");
+@@ -1109,7 +1151,11 @@
+             assert!(runtime.ignored_files.contains(&path));
+             write_file(
+                 &path,
+-                &format!("{}{}", session_header(&Uuid::new_v4().to_string()), task_event("task_started", "ignored-turn")),
++                &format!(
++                    "{}{}",
++                    session_header(&Uuid::new_v4().to_string()),
++                    task_event("task_started", "ignored-turn")
++                ),
+             );
+             process_file_updates(&mut runtime, &path, None);
+             assert!(runtime.tasks.is_empty());
+--- a/apps/desktop-tauri/src-tauri/src/main.rs
++++ b/apps/desktop-tauri/src-tauri/src/main.rs
+@@ -412,19 +412,8 @@
+             Ok(())
+         })
+         .on_window_event(move |window, event| {
+-            if taskbar_overlay::window::is_measurement_window_label(window.label()) {
+-                if matches!(event, tauri::WindowEvent::Destroyed) {
+-                    status_surfaces::handle_taskbar_measurement_window_destroyed(
+-                        window.app_handle(),
+-                    );
+-                }
+-                return;
+-            }
+             if window.label() == crate::shell::settings_window::SETTINGS_LABEL {
+-                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+-                    api.prevent_close();
+-                    let _ = window.hide();
+-                }
++                // Let the native close destroy Settings. The main tray host stays alive.
+                 return;
+             }
+             if let Some(surface) = status_surfaces::surface_for_window_label(window.label()) {
+@@ -473,6 +462,10 @@
+                 return;
+             }
+             match event {
++                tauri::WindowEvent::CloseRequested { api, .. } => {
++                    api.prevent_close();
++                    let _ = crate::shell::flyout_window::hide(window.app_handle());
++                }
+                 tauri::WindowEvent::Focused(false)
+                     if !proof_harness::is_proof_mode(window.app_handle())
+                         && crate::shell::flyout_window::should_blur_dismiss() =>
+--- a/apps/desktop-tauri/src-tauri/src/proof_harness.rs
++++ b/apps/desktop-tauri/src-tauri/src/proof_harness.rs
+@@ -338,17 +338,9 @@
+         .unwrap_or(false)
+ }
+ 
+-pub fn is_taskbar_status_scenario(scenario: ProofScenario) -> bool {
++#[cfg(test)]
++fn is_taskbar_status_scenario(scenario: ProofScenario) -> bool {
+     matches!(scenario, ProofScenario::TaskbarStatus(_))
+-}
+-
+-pub fn is_taskbar_status_proof(app: &AppHandle) -> bool {
+-    let state = app.state::<Mutex<AppState>>();
+-    state
+-        .lock()
+-        .ok()
+-        .and_then(|state| state.proof_config.as_ref().map(|cfg| cfg.scenario))
+-        .is_some_and(is_taskbar_status_scenario)
+ }
+ 
+ fn profile(id: Uuid, kind: ProfileKind, label: &str, auth_mode: AuthMode) -> AccountProfile {
+--- a/apps/desktop-tauri/src-tauri/src/shell/flyout_window.rs
++++ b/apps/desktop-tauri/src-tauri/src/shell/flyout_window.rs
+@@ -3,7 +3,7 @@
+ 
+ use crate::window_positioner::{Rect, clamp_to_monitor, place_flyout_sized, subtract_taskbar};
+ use std::sync::atomic::{AtomicBool, Ordering};
+-use tauri::{AppHandle, Manager, PhysicalPosition, PhysicalSize};
++use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize};
+ 
+ /// The tray panel is the configured `main` WebView. Keeping this label in
+ /// sync with `App.tsx` is important: unknown labels intentionally render
+@@ -223,6 +223,7 @@
+     apply_rect(&window, rect)?;
+     let _ = crate::shell::dwm::shape_rounded_rect_window(&window, 28);
+     window.show().map_err(|e| e.to_string())?;
++    let _ = window.emit("codexbar:tray-visibility", true);
+     window.set_focus().map_err(|e| e.to_string())?;
+     Ok(())
+ }
+@@ -239,6 +240,7 @@
+ pub fn hide(app: &AppHandle) -> Result<(), String> {
+     if let Some(window) = app.get_webview_window(FLYOUT_LABEL) {
+         window.hide().map_err(|e| e.to_string())?;
++        let _ = window.emit("codexbar:tray-visibility", false);
+     }
+     Ok(())
+ }
+--- a/apps/desktop-tauri/src-tauri/src/shell/settings_window.rs
++++ b/apps/desktop-tauri/src-tauri/src/shell/settings_window.rs
+@@ -78,12 +78,11 @@
+ 
+ /// Dismiss Settings without exiting CodexBar.
+ ///
+-/// The detached Settings window is hidden instead of closed so Tauri's
+-/// process/window lifecycle cannot interpret this as an app quit. If Settings
+-/// is rendered in the main shell surface, hide that surface back to tray.
++/// The main tray host remains alive, so destroying this auxiliary window
++/// releases its WebView without exiting the application.
+ pub fn dismiss(_app: &tauri::AppHandle, window: &tauri::WebviewWindow) -> Result<(), String> {
+     if window.label() == SETTINGS_LABEL {
+-        return window.hide().map_err(|e| e.to_string());
++        return window.destroy().map_err(|e| e.to_string());
+     }
+ 
+     Ok(())
+--- a/apps/desktop-tauri/src-tauri/src/status_surfaces.rs
++++ b/apps/desktop-tauri/src-tauri/src/status_surfaces.rs
+@@ -304,46 +304,6 @@
+     true
+ }
+ 
+-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+-enum StateMutationDispatch {
+-    Immediate,
+-    Deferred,
+-}
+-
+-fn try_with_state_or_defer<T, O, D>(
+-    state: &Mutex<T>,
+-    operation: O,
+-    defer: D,
+-) -> StateMutationDispatch
+-where
+-    O: FnOnce(&mut T),
+-    D: FnOnce(),
+-{
+-    match state.try_lock() {
+-        Ok(mut state) => {
+-            operation(&mut state);
+-            StateMutationDispatch::Immediate
+-        }
+-        Err(_) => {
+-            defer();
+-            StateMutationDispatch::Deferred
+-        }
+-    }
+-}
+-
+-fn reconcile_deferred_measurement_state<T, W>(
+-    state: &Mutex<T>,
+-    lookup_live_measurement: impl FnOnce() -> Option<W>,
+-    reconcile: impl FnOnce(&mut T, Option<W>),
+-) -> bool {
+-    let Ok(mut state) = state.lock() else {
+-        return false;
+-    };
+-    let live_measurement = lookup_live_measurement();
+-    reconcile(&mut state, live_measurement);
+-    true
+-}
+-
+ pub fn start_monitor(app: tauri::AppHandle) {
+     tauri::async_runtime::spawn(async move {
+         let mut interval =
+@@ -375,43 +335,6 @@
+     });
+ }
+ 
+-pub fn handle_taskbar_measurement_window_destroyed(app: &tauri::AppHandle) {
+-    let deferred_app = app.clone();
+-    let dispatch = try_with_state_or_defer(
+-        &app.state::<Mutex<StatusSurfaceState>>(),
+-        |state| state.taskbar.handle_measurement_window_destroyed(),
+-        move || {
+-            tauri::async_runtime::spawn(async move {
+-                let state = deferred_app.state::<Mutex<StatusSurfaceState>>();
+-                if !reconcile_deferred_measurement_state(
+-                    &state,
+-                    || {
+-                        deferred_app.get_webview_window(
+-                            crate::taskbar_overlay::window::TASKBAR_MEASUREMENT_WINDOW_LABEL,
+-                        )
+-                    },
+-                    |state, live_measurement| {
+-                        state
+-                            .taskbar
+-                            .reconcile_measurement_window_after_destroy(live_measurement);
+-                    },
+-                ) {
+-                    tracing::debug!(
+-                        code = "TASKBAR_MEASUREMENT_DESTROY_DEFERRED_FAILED",
+-                        "taskbar measurement cache cleanup retry failed"
+-                    );
+-                }
+-            });
+-        },
+-    );
+-    if dispatch == StateMutationDispatch::Deferred {
+-        tracing::debug!(
+-            code = "TASKBAR_MEASUREMENT_DESTROY_DEFERRED",
+-            "taskbar measurement cache cleanup deferred"
+-        );
+-    }
+-}
+-
+ pub fn handle_float_ball_window_destroyed(app: &tauri::AppHandle) {
+     try_with_state(&app.state::<Mutex<StatusSurfaceState>>(), |state| {
+         state.float_ball.handle_window_destroyed();
+@@ -437,7 +360,7 @@
+ }
+ 
+ fn authorize_taskbar_width(caller_label: &str, taskbar_enabled: bool) -> Result<(), &'static str> {
+-    if !crate::taskbar_overlay::window::is_measurement_window_label(caller_label) {
++    if caller_label != crate::taskbar_overlay::window::TASKBAR_WINDOW_LABEL {
+         return Err("TASKBAR_MEASUREMENT_UNAUTHORIZED");
+     }
+     if !taskbar_enabled {
+@@ -486,8 +409,6 @@
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+-    use std::sync::{Arc, mpsc};
+-    use std::time::Duration;
+ 
+     #[test]
+     fn diagnostics_command_returns_recorded_snapshots() {
+@@ -579,17 +500,14 @@
+     }
+ 
+     #[test]
+-    fn taskbar_width_requires_the_enabled_measurement_window() {
++    fn taskbar_width_requires_the_enabled_taskbar_window() {
++        assert_eq!(authorize_taskbar_width("taskbar-status", true), Ok(()));
+         assert_eq!(
+             authorize_taskbar_width("taskbar-status-measure", true),
+-            Ok(())
+-        );
+-        assert_eq!(
+-            authorize_taskbar_width("taskbar-status", true),
+             Err("TASKBAR_MEASUREMENT_UNAUTHORIZED")
+         );
+         assert_eq!(
+-            authorize_taskbar_width("taskbar-status-measure", false),
++            authorize_taskbar_width("taskbar-status", false),
+             Err("TASKBAR_STATUS_DISABLED")
+         );
+     }
+@@ -597,8 +515,12 @@
+     #[test]
+     fn rejected_taskbar_width_requests_do_not_run_mutation() {
+         for (label, enabled, expected_error) in [
+-            ("taskbar-status", true, "TASKBAR_MEASUREMENT_UNAUTHORIZED"),
+-            ("taskbar-status-measure", false, "TASKBAR_STATUS_DISABLED"),
++            (
++                "taskbar-status-measure",
++                true,
++                "TASKBAR_MEASUREMENT_UNAUTHORIZED",
++            ),
++            ("taskbar-status", false, "TASKBAR_STATUS_DISABLED"),
+         ] {
+             let mutation_ran = std::cell::Cell::new(false);
+             assert_eq!(
+@@ -633,123 +555,4 @@
+         assert!(!should_hide_for_fullscreen(&settings, true));
+         assert!(!should_hide_for_fullscreen(&settings, false));
+     }
+-
+-    #[test]
+-    fn deferred_old_destroy_preserves_replacement_cache_from_late_registry_lookup() {
+-        #[derive(Debug)]
+-        struct FakeMeasurementState {
+-            enabled: bool,
+-            cache: Option<&'static str>,
+-            reconciliations: usize,
+-        }
+-
+-        let state = Arc::new(Mutex::new(FakeMeasurementState {
+-            enabled: true,
+-            cache: Some("old helper"),
+-            reconciliations: 0,
+-        }));
+-        let registry = Arc::new(Mutex::new(Some("old helper")));
+-        let mut guard = state.lock().expect("surface manager lock");
+-        let deferred_state = Arc::clone(&state);
+-        let deferred_registry = Arc::clone(&registry);
+-        let (started_tx, started_rx) = mpsc::channel();
+-        let (lookup_tx, lookup_rx) = mpsc::channel();
+-        let (lookup_gate_tx, lookup_gate_rx) = mpsc::channel();
+-        let (completed_tx, completed_rx) = mpsc::channel();
+-
+-        let dispatch = try_with_state_or_defer(
+-            state.as_ref(),
+-            |state| state.cache = None,
+-            move || {
+-                std::thread::spawn(move || {
+-                    started_tx.send(()).expect("report deferred start");
+-                    let reconciled = reconcile_deferred_measurement_state(
+-                        deferred_state.as_ref(),
+-                        || {
+-                            lookup_tx.send(()).expect("report registry lookup");
+-                            lookup_gate_rx.recv().expect("allow registry lookup");
+-                            *deferred_registry.lock().expect("registry lock")
+-                        },
+-                        |state, live| {
+-                            state.cache = live;
+-                            state.reconciliations += 1;
+-                        },
+-                    );
+-                    completed_tx
+-                        .send(reconciled)
+-                        .expect("report deferred reconciliation");
+-                });
+-            },
+-        );
+-
+-        assert_eq!(dispatch, StateMutationDispatch::Deferred);
+-        started_rx
+-            .recv_timeout(Duration::from_secs(2))
+-            .expect("deferred worker start");
+-        let lookup_was_early = lookup_rx.recv_timeout(Duration::from_millis(100)).is_ok();
+-
+-        guard.cache = Some("new helper");
+-        *registry.lock().expect("registry lock") = Some("new helper");
+-        assert!(guard.enabled);
+-        drop(guard);
+-        lookup_gate_tx.send(()).expect("release registry lookup");
+-        assert!(
+-            completed_rx
+-                .recv_timeout(Duration::from_secs(2))
+-                .expect("deferred reconciliation completion")
+-        );
+-
+-        let state = state.lock().expect("final state lock");
+-        assert!(!lookup_was_early);
+-        assert_eq!(state.cache, Some("new helper"));
+-        assert_eq!(state.reconciliations, 1);
+-        assert!(state.enabled);
+-    }
+-
+-    #[test]
+-    fn deferred_destroy_clears_cache_when_registry_has_no_live_helper() {
+-        #[derive(Debug)]
+-        struct FakeMeasurementState {
+-            enabled: bool,
+-            cache: Option<&'static str>,
+-        }
+-
+-        let state = Arc::new(Mutex::new(FakeMeasurementState {
+-            enabled: true,
+-            cache: Some("stale helper"),
+-        }));
+-        let guard = state.lock().expect("surface manager lock");
+-        let deferred_state = Arc::clone(&state);
+-        let (completed_tx, completed_rx) = mpsc::channel();
+-
+-        let dispatch = try_with_state_or_defer(
+-            state.as_ref(),
+-            |state| state.cache = None,
+-            move || {
+-                std::thread::spawn(move || {
+-                    let reconciled = reconcile_deferred_measurement_state(
+-                        deferred_state.as_ref(),
+-                        || None,
+-                        |state, live| state.cache = live,
+-                    );
+-                    completed_tx
+-                        .send(reconciled)
+-                        .expect("report deferred reconciliation");
+-                });
+-            },
+-        );
+-
+-        assert_eq!(dispatch, StateMutationDispatch::Deferred);
+-        assert_eq!(guard.cache, Some("stale helper"));
+-        drop(guard);
+-        assert!(
+-            completed_rx
+-                .recv_timeout(Duration::from_secs(2))
+-                .expect("deferred reconciliation completion")
+-        );
+-
+-        let state = state.lock().expect("final state lock");
+-        assert_eq!(state.cache, None);
+-        assert!(state.enabled);
+-    }
+-}
++}
+--- a/apps/desktop-tauri/src-tauri/src/taskbar_overlay/mod.rs
++++ b/apps/desktop-tauri/src-tauri/src/taskbar_overlay/mod.rs
+@@ -2,58 +2,9 @@
+ pub mod win32;
+ pub mod window;
+ 
+-use crate::status_surfaces::window_lifecycle::{CloseOutcome, close_cached_or_labeled};
++use crate::status_surfaces::window_lifecycle::close_cached_or_labeled;
+ use positioning::{Rect, compute_slot};
+ use tauri::LogicalSize;
+-
+-const TASKBAR_MEASUREMENT_WINDOW_CLOSE_FAILED: &str = "TASKBAR_MEASUREMENT_WINDOW_CLOSE_FAILED";
+-
+-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+-enum MeasurementAvailability {
+-    Ready,
+-    Deferred,
+-}
+-
+-fn enable_windows_with(
+-    ensure_visible: impl FnOnce() -> Result<(), String>,
+-    ensure_measurement: impl FnOnce() -> Result<(), String>,
+-) -> Result<MeasurementAvailability, String> {
+-    ensure_visible()?;
+-    Ok(if ensure_measurement().is_ok() {
+-        MeasurementAvailability::Ready
+-    } else {
+-        MeasurementAvailability::Deferred
+-    })
+-}
+-
+-fn disable_windows_with(
+-    close_measurement: impl FnOnce() -> Result<(), String>,
+-    close_visible: impl FnOnce() -> Result<(), String>,
+-) -> Result<(), String> {
+-    close_measurement().map_err(|_| TASKBAR_MEASUREMENT_WINDOW_CLOSE_FAILED.to_string())?;
+-    close_visible()
+-}
+-
+-fn apply_disabled_with(
+-    enabled: &mut bool,
+-    close_measurement: impl FnOnce() -> Result<(), String>,
+-    close_visible: impl FnOnce() -> Result<(), String>,
+-) -> Result<(), String> {
+-    let previous_enabled = *enabled;
+-    *enabled = false;
+-    if let Err(error) = disable_windows_with(close_measurement, close_visible) {
+-        *enabled = previous_enabled;
+-        return Err(error);
+-    }
+-    Ok(())
+-}
+-
+-fn require_measurement_destroyed(outcome: CloseOutcome) -> Result<(), &'static str> {
+-    match outcome {
+-        CloseOutcome::Destroyed => Ok(()),
+-        CloseOutcome::HiddenPendingDestroy => Err(TASKBAR_MEASUREMENT_WINDOW_CLOSE_FAILED),
+-    }
+-}
+ 
+ fn enable_logical_width(previously_enabled: bool, current_width: u32) -> u32 {
+     if previously_enabled {
+@@ -61,37 +12,6 @@
+     } else {
+         window::TASKBAR_SAFE_FALLBACK_LOGICAL_WIDTH
+     }
+-}
+-
+-fn replace_measurement_cache_preserving_enabled<T>(
+-    enabled: &mut bool,
+-    cache: &mut Option<T>,
+-    live_measurement: Option<T>,
+-) {
+-    let previous_enabled = *enabled;
+-    *cache = live_measurement;
+-    *enabled = previous_enabled;
+-}
+-
+-trait EnabledWindowOperations {
+-    fn ensure_measurement(&mut self) -> Result<(), String>;
+-    fn reposition_visible(&mut self) -> Result<(), String>;
+-}
+-
+-fn reconcile_enabled_with(
+-    operations: &mut impl EnabledWindowOperations,
+-    on_measurement_deferred: impl FnOnce(),
+-) -> Result<MeasurementAvailability, String> {
+-    let availability = if operations.ensure_measurement().is_ok() {
+-        MeasurementAvailability::Ready
+-    } else {
+-        MeasurementAvailability::Deferred
+-    };
+-    if availability == MeasurementAvailability::Deferred {
+-        on_measurement_deferred();
+-    }
+-    operations.reposition_visible()?;
+-    Ok(availability)
+ }
+ 
+ pub fn clamp_logical_width(width: f64) -> u32 {
+@@ -149,7 +69,6 @@
+ 
+ pub struct TaskbarOverlay {
+     window: Option<tauri::WebviewWindow>,
+-    measurement_window: Option<tauri::WebviewWindow>,
+     enabled: bool,
+     logical_width: u32,
+     last_slot: Option<Rect>,
+@@ -159,7 +78,6 @@
+     fn default() -> Self {
+         Self {
+             window: None,
+-            measurement_window: None,
+             enabled: false,
+             logical_width: window::TASKBAR_SAFE_FALLBACK_LOGICAL_WIDTH,
+             last_slot: None,
+@@ -177,29 +95,12 @@
+ 
+         self.logical_width = enable_logical_width(previous_enabled, self.logical_width);
+ 
+-        let logical_width = self.logical_width;
+-        let mut visible_window = None;
+-        let mut measurement_window = None;
+-        let availability = enable_windows_with(
+-            || {
+-                visible_window = Some(window::get_or_create(app, logical_width)?);
+-                Ok(())
+-            },
+-            || {
+-                measurement_window = Some(window::get_or_create_measurement(app)?);
+-                Ok(())
+-            },
+-        )?;
+-        self.window = visible_window;
+-        if let Some(measurement_window) = measurement_window {
+-            self.measurement_window = Some(measurement_window);
+-        }
+-        if availability == MeasurementAvailability::Deferred {
+-            tracing::debug!(
+-                code = "TASKBAR_MEASUREMENT_CREATE_DEFERRED",
+-                proof_mode = crate::proof_harness::is_taskbar_status_proof(app),
+-                "taskbar measurement helper retry deferred"
+-            );
++        match window::get_or_create(app, self.logical_width) {
++            Ok(window) => self.window = Some(window),
++            Err(error) => {
++                self.enabled = previous_enabled;
++                return Err(error);
++            }
+         }
+         self.reposition(app)
+     }
+@@ -239,17 +140,7 @@
+     #[allow(dead_code)]
+     pub fn handle_shell_change(&mut self, app: &tauri::AppHandle) -> Result<(), String> {
+         match crate::status_surfaces::reconciliation_action(self.is_enabled()) {
+-            crate::status_surfaces::ReconciliationAction::Reposition => {
+-                let mut operations = OverlayEnabledWindowOperations { overlay: self, app };
+-                reconcile_enabled_with(&mut operations, || {
+-                    tracing::debug!(
+-                        code = "TASKBAR_MEASUREMENT_CREATE_DEFERRED",
+-                        proof_mode = crate::proof_harness::is_taskbar_status_proof(app),
+-                        "taskbar measurement helper retry deferred"
+-                    );
+-                })?;
+-                Ok(())
+-            }
++            crate::status_surfaces::ReconciliationAction::Reposition => self.reposition(app),
+             crate::status_surfaces::ReconciliationAction::Cleanup => {
+                 self.cleanup_disabled_window(app)
+             }
+@@ -329,46 +220,16 @@
+         self.last_slot = None;
+     }
+ 
+-    pub fn handle_measurement_window_destroyed(&mut self) {
+-        self.reconcile_measurement_window_after_destroy(None);
+-    }
+-
+-    pub fn reconcile_measurement_window_after_destroy(
+-        &mut self,
+-        live_measurement: Option<tauri::WebviewWindow>,
+-    ) {
+-        replace_measurement_cache_preserving_enabled(
+-            &mut self.enabled,
+-            &mut self.measurement_window,
+-            live_measurement,
+-        );
+-    }
+-
+     fn cleanup_disabled_window(&mut self, app: &tauri::AppHandle) -> Result<(), String> {
+-        let measurement_window = &mut self.measurement_window;
+-        let visible_window = &mut self.window;
+-        apply_disabled_with(
+-            &mut self.enabled,
+-            || {
+-                let outcome = close_cached_or_labeled(
+-                    app,
+-                    measurement_window,
+-                    window::TASKBAR_MEASUREMENT_WINDOW_LABEL,
+-                )?;
+-                require_measurement_destroyed(outcome).map_err(str::to_string)
+-            },
+-            || {
+-                close_cached_or_labeled(app, visible_window, window::TASKBAR_WINDOW_LABEL)
+-                    .map(|_| ())
+-            },
+-        )?;
++        let previous_enabled = self.enabled;
++        self.enabled = false;
++        if let Err(error) =
++            close_cached_or_labeled(app, &mut self.window, window::TASKBAR_WINDOW_LABEL)
++        {
++            self.enabled = previous_enabled;
++            return Err(error);
++        }
+         self.last_slot = None;
+-        Ok(())
+-    }
+-
+-    fn ensure_measurement_window(&mut self, app: &tauri::AppHandle) -> Result<(), String> {
+-        let measurement = window::get_or_create_measurement(app)?;
+-        self.measurement_window = Some(measurement);
+         Ok(())
+     }
+ 
+@@ -376,21 +237,6 @@
+         let window = window::get_or_create(app, self.logical_width)?;
+         self.window = Some(window.clone());
+         Ok(window)
+-    }
+-}
+-
+-struct OverlayEnabledWindowOperations<'a> {
+-    overlay: &'a mut TaskbarOverlay,
+-    app: &'a tauri::AppHandle,
+-}
+-
+-impl EnabledWindowOperations for OverlayEnabledWindowOperations<'_> {
+-    fn ensure_measurement(&mut self) -> Result<(), String> {
+-        self.overlay.ensure_measurement_window(self.app)
+-    }
+-
+-    fn reposition_visible(&mut self) -> Result<(), String> {
+-        self.overlay.reposition(self.app)
+     }
+ }
+ 
+@@ -448,189 +294,6 @@
+     fn a_new_enable_uses_fallback_while_reconciliation_keeps_confirmed_width() {
+         assert_eq!(enable_logical_width(false, 167), 318);
+         assert_eq!(enable_logical_width(true, 167), 167);
+-    }
+-
+-    #[test]
+-    fn measurement_creation_failure_keeps_visible_enabled_at_fallback() {
+-        let result = enable_windows_with(|| Ok(()), || Err("CREATE".into())).unwrap();
+-        assert_eq!(result, MeasurementAvailability::Deferred);
+-    }
+-
+-    #[test]
+-    fn disable_closes_measurement_before_visible() {
+-        let calls = std::cell::RefCell::new(Vec::new());
+-        disable_windows_with(
+-            || {
+-                calls.borrow_mut().push("measurement");
+-                Ok(())
+-            },
+-            || {
+-                calls.borrow_mut().push("visible");
+-                Ok(())
+-            },
+-        )
+-        .unwrap();
+-        assert_eq!(*calls.borrow(), ["measurement", "visible"]);
+-    }
+-
+-    #[test]
+-    fn measurement_close_failure_does_not_close_visible() {
+-        let visible_closed = std::cell::Cell::new(false);
+-        assert_eq!(
+-            disable_windows_with(
+-                || Err("CLOSE".into()),
+-                || {
+-                    visible_closed.set(true);
+-                    Ok(())
+-                },
+-            ),
+-            Err("TASKBAR_MEASUREMENT_WINDOW_CLOSE_FAILED".to_string())
+-        );
+-        assert!(!visible_closed.get());
+-    }
+-
+-    #[test]
+-    fn failed_measurement_close_restores_enabled_without_closing_visible() {
+-        let mut enabled = true;
+-        let visible_closed = std::cell::Cell::new(false);
+-
+-        assert_eq!(
+-            apply_disabled_with(
+-                &mut enabled,
+-                || Err("native close failed".to_string()),
+-                || {
+-                    visible_closed.set(true);
+-                    Ok(())
+-                },
+-            ),
+-            Err("TASKBAR_MEASUREMENT_WINDOW_CLOSE_FAILED".to_string())
+-        );
+-        assert!(enabled);
+-        assert!(!visible_closed.get());
+-    }
+-
+-    #[test]
+-    fn measurement_destroyed_clears_cache_without_changing_enabled() {
+-        let mut enabled = true;
+-        let mut measurement_cache = Some("stale helper");
+-
+-        replace_measurement_cache_preserving_enabled(&mut enabled, &mut measurement_cache, None);
+-
+-        assert!(enabled);
+-        assert_eq!(measurement_cache, None);
+-    }
+-
+-    #[test]
+-    fn deferred_measurement_reconciliation_refreshes_cache_without_changing_enabled() {
+-        let mut enabled = true;
+-        let mut measurement_cache = Some("old helper");
+-
+-        replace_measurement_cache_preserving_enabled(
+-            &mut enabled,
+-            &mut measurement_cache,
+-            Some("new helper"),
+-        );
+-
+-        assert!(enabled);
+-        assert_eq!(measurement_cache, Some("new helper"));
+-    }
+-
+-    #[test]
+-    fn visible_close_failure_restores_enabled_then_reconciliation_recreates_helper_first() {
+-        let mut enabled = true;
+-        let calls = std::cell::RefCell::new(Vec::new());
+-
+-        assert_eq!(
+-            apply_disabled_with(
+-                &mut enabled,
+-                || {
+-                    calls.borrow_mut().push("close measurement");
+-                    Ok(())
+-                },
+-                || {
+-                    calls.borrow_mut().push("close visible");
+-                    Err("visible close failed".to_string())
+-                },
+-            ),
+-            Err("visible close failed".to_string())
+-        );
+-        assert!(enabled);
+-
+-        struct FakeEnabledWindowOperations<'a> {
+-            calls: &'a std::cell::RefCell<Vec<&'static str>>,
+-        }
+-
+-        impl EnabledWindowOperations for FakeEnabledWindowOperations<'_> {
+-            fn ensure_measurement(&mut self) -> Result<(), String> {
+-                self.calls.borrow_mut().push("recreate measurement");
+-                Ok(())
+-            }
+-
+-            fn reposition_visible(&mut self) -> Result<(), String> {
+-                self.calls.borrow_mut().push("reposition visible");
+-                Ok(())
+-            }
+-        }
+-
+-        let mut operations = FakeEnabledWindowOperations { calls: &calls };
+-        assert_eq!(
+-            reconcile_enabled_with(&mut operations, || {}),
+-            Ok(MeasurementAvailability::Ready)
+-        );
+-        assert_eq!(
+-            *calls.borrow(),
+-            [
+-                "close measurement",
+-                "close visible",
+-                "recreate measurement",
+-                "reposition visible"
+-            ]
+-        );
+-    }
+-
+-    #[test]
+-    fn deferred_diagnostic_runs_before_failed_visible_reposition() {
+-        struct FailingEnabledWindowOperations<'a> {
+-            calls: &'a std::cell::RefCell<Vec<&'static str>>,
+-        }
+-
+-        impl EnabledWindowOperations for FailingEnabledWindowOperations<'_> {
+-            fn ensure_measurement(&mut self) -> Result<(), String> {
+-                self.calls.borrow_mut().push("ensure measurement");
+-                Err("helper create failed".to_string())
+-            }
+-
+-            fn reposition_visible(&mut self) -> Result<(), String> {
+-                self.calls.borrow_mut().push("reposition visible");
+-                Err("visible reposition failed".to_string())
+-            }
+-        }
+-
+-        let calls = std::cell::RefCell::new(Vec::new());
+-        let mut operations = FailingEnabledWindowOperations { calls: &calls };
+-
+-        assert_eq!(
+-            reconcile_enabled_with(&mut operations, || {
+-                calls.borrow_mut().push("measurement deferred diagnostic");
+-            }),
+-            Err("visible reposition failed".to_string())
+-        );
+-        assert_eq!(
+-            *calls.borrow(),
+-            [
+-                "ensure measurement",
+-                "measurement deferred diagnostic",
+-                "reposition visible"
+-            ]
+-        );
+-    }
+-
+-    #[test]
+-    fn hidden_pending_destroy_is_not_a_completed_measurement_close() {
+-        assert_eq!(
+-            require_measurement_destroyed(CloseOutcome::HiddenPendingDestroy),
+-            Err("TASKBAR_MEASUREMENT_WINDOW_CLOSE_FAILED")
+-        );
+     }
+ 
+     #[test]
+--- a/apps/desktop-tauri/src-tauri/src/taskbar_overlay/window.rs
++++ b/apps/desktop-tauri/src-tauri/src/taskbar_overlay/window.rs
+@@ -4,9 +4,6 @@
+ 
+ pub const TASKBAR_WINDOW_LABEL: &str = "taskbar-status";
+ pub const TASKBAR_FRONTEND_ROUTE: &str = "index.html?window=taskbar-status";
+-pub const TASKBAR_MEASUREMENT_WINDOW_LABEL: &str = "taskbar-status-measure";
+-pub const TASKBAR_MEASUREMENT_FRONTEND_ROUTE: &str = "index.html?window=taskbar-status-measure";
+-pub const TASKBAR_MEASUREMENT_LOGICAL_WIDTH: u32 = 318;
+ pub const TASKBAR_MIN_LOGICAL_WIDTH: u32 = 104;
+ pub const TASKBAR_MAX_LOGICAL_WIDTH: u32 = 318;
+ pub const TASKBAR_SAFE_FALLBACK_LOGICAL_WIDTH: u32 = 318;
+@@ -49,41 +46,6 @@
+     Ok(window)
+ }
+ 
+-pub fn get_or_create_measurement(app: &tauri::AppHandle) -> Result<tauri::WebviewWindow, String> {
+-    if let Some(window) = app.get_webview_window(TASKBAR_MEASUREMENT_WINDOW_LABEL) {
+-        return Ok(window);
+-    }
+-    tauri::WebviewWindowBuilder::new(
+-        app,
+-        TASKBAR_MEASUREMENT_WINDOW_LABEL,
+-        WebviewUrl::App(TASKBAR_MEASUREMENT_FRONTEND_ROUTE.into()),
+-    )
+-    .title("codex-barbar taskbar measurement")
+-    .inner_size(
+-        f64::from(TASKBAR_MEASUREMENT_LOGICAL_WIDTH),
+-        f64::from(TASKBAR_LOGICAL_HEIGHT),
+-    )
+-    .resizable(false)
+-    .maximizable(false)
+-    .minimizable(false)
+-    .closable(false)
+-    .decorations(false)
+-    .shadow(false)
+-    .transparent(true)
+-    .background_color(tauri::window::Color(0, 0, 0, 0))
+-    .skip_taskbar(true)
+-    .focusable(false)
+-    .focused(false)
+-    .theme(Some(tauri::Theme::Dark))
+-    .visible(false)
+-    .build()
+-    .map_err(|_| "TASKBAR_MEASUREMENT_WINDOW_CREATE_FAILED".to_string())
+-}
+-
+-pub fn is_measurement_window_label(label: &str) -> bool {
+-    label == TASKBAR_MEASUREMENT_WINDOW_LABEL
+-}
+-
+ pub fn position_and_show(window: &tauri::WebviewWindow, slot: Rect) -> Result<(), String> {
+     crate::shell::dwm::set_no_activate_bounds(window, slot.x, slot.y, slot.width, slot.height, true)
+ }
+@@ -119,17 +81,4 @@
+         assert_eq!(TASKBAR_SAFE_FALLBACK_LOGICAL_WIDTH, 318);
+         assert_eq!(TASKBAR_LOGICAL_HEIGHT, 40);
+     }
+-
+-    #[test]
+-    fn measurement_window_contract_is_fixed_and_hidden() {
+-        assert_eq!(TASKBAR_MEASUREMENT_WINDOW_LABEL, "taskbar-status-measure");
+-        assert_eq!(
+-            TASKBAR_MEASUREMENT_FRONTEND_ROUTE,
+-            "index.html?window=taskbar-status-measure"
+-        );
+-        assert_eq!(TASKBAR_MEASUREMENT_LOGICAL_WIDTH, 318);
+-        assert_eq!(TASKBAR_LOGICAL_HEIGHT, 40);
+-        assert!(is_measurement_window_label("taskbar-status-measure"));
+-        assert!(!is_measurement_window_label("taskbar-status"));
+-    }
+ }
+--- a/apps/desktop-tauri/src-tauri/src/window_positioner.rs
++++ b/apps/desktop-tauri/src-tauri/src/window_positioner.rs
+@@ -135,7 +135,7 @@
+         let rect = place_flyout(work_area, 2.0);
+         assert!(work_area.contains(&rect));
+         assert_eq!(rect.width, 760);
+-        assert_eq!(rect.height, 940);
++        assert_eq!(rect.height, 1160);
+         assert_eq!(rect.x, work_area.width - rect.width - WORK_AREA_INSET);
+         assert_eq!(rect.y, work_area.height - rect.height - WORK_AREA_INSET);
+     }
+--- a/apps/desktop-tauri/src/App.test.tsx
++++ b/apps/desktop-tauri/src/App.test.tsx
+@@ -7,7 +7,7 @@
+ }));
+ 
+ vi.mock("@tauri-apps/api/webviewWindow", () => ({
+-  getCurrentWebviewWindow: () => ({ label: webviewWindowMocks.label }),
++  getCurrentWebviewWindow: () => ({ label: webviewWindowMocks.label, isVisible: () => Promise.resolve(true) }),
+ }));
+ 
+ vi.mock("@tauri-apps/api/event", () => ({
+@@ -154,13 +154,13 @@
+     ).toBeInTheDocument();
+   });
+ 
+-  it("routes the hidden taskbar measurement window to measurement-only content", async () => {
++  it("does not mount a separate taskbar measurement page", async () => {
+     webviewWindowMocks.label = "taskbar-status-measure";
+     invokeMock.mockResolvedValue(bootstrapFixture);
+ 
+     render(<App />);
+ 
+-    expect(await screen.findByTestId("taskbar-status-measurement")).toBeInTheDocument();
++    expect(screen.queryByTestId("taskbar-status-measurement")).toBeNull();
+     expect(screen.queryByTestId("taskbar-status-visible")).toBeNull();
+   });
+ 
+--- a/apps/desktop-tauri/src/App.tsx
++++ b/apps/desktop-tauri/src/App.tsx
+@@ -1,8 +1,7 @@
+ import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
+-import TrayPanel from "./surfaces/TrayPanel";
++import TrayHost from "./surfaces/TrayHost";
+ import Settings from "./surfaces/Settings";
+ import TaskbarStatus from "./surfaces/TaskbarStatus";
+-import TaskbarStatusMeasure from "./surfaces/TaskbarStatusMeasure";
+ import FloatBall from "./surfaces/FloatBall";
+ 
+ /**
+@@ -17,13 +16,10 @@
+     return <Settings />;
+   }
+   if (label === "main") {
+-    return <TrayPanel />;
++    return <TrayHost />;
+   }
+   if (label === "taskbar-status") {
+     return <TaskbarStatus />;
+-  }
+-  if (label === "taskbar-status-measure") {
+-    return <TaskbarStatusMeasure />;
+   }
+   if (label === "float-ball") {
+     return <FloatBall />;
+--- a/apps/desktop-tauri/src/surfaces/TaskbarStatus.test.tsx
++++ b/apps/desktop-tauri/src/surfaces/TaskbarStatus.test.tsx
+@@ -46,13 +46,46 @@
+ }
+ 
+ describe("TaskbarStatus", () => {
++  it("reports intrinsic width from its own replica and disconnects on unmount", async () => {
++    let report!: ResizeObserverCallback;
++    const disconnect = vi.fn();
++    const observe = vi.fn();
++    vi.stubGlobal("ResizeObserver", class {
++      constructor(callback: ResizeObserverCallback) { report = callback; }
++      observe = observe;
++      disconnect = disconnect;
++    });
++    invokeMock.mockResolvedValue(bootstrapWithTwoProfiles());
++    try {
++      const view = render(<TaskbarStatus />);
++      const replica = await screen.findByTestId("taskbar-status-measurement");
++      expect(observe).toHaveBeenCalledWith(replica);
++      const notify = async (width: number) => {
++        await act(async () => report([
++          { target: replica, borderBoxSize: [{ inlineSize: width }] } as unknown as ResizeObserverEntry,
++        ], {} as ResizeObserver));
++      };
++      await notify(156);
++      expect(invokeMock).toHaveBeenCalledWith("set_taskbar_status_width", { width: 172 });
++      await notify(220);
++      expect(invokeMock).toHaveBeenCalledWith("set_taskbar_status_width", { width: 236 });
++      const count = invokeMock.mock.calls.filter(([name]) => name === "set_taskbar_status_width").length;
++      await notify(220);
++      expect(invokeMock.mock.calls.filter(([name]) => name === "set_taskbar_status_width")).toHaveLength(count);
++      view.unmount();
++      expect(disconnect).toHaveBeenCalledOnce();
++    } finally {
++      vi.unstubAllGlobals();
++    }
++  });
++
+   beforeEach(() => {
+     invokeMock.mockReset();
+     eventHarness.listeners.clear();
+     window.history.replaceState({}, "", "/");
+   });
+ 
+-  it("renders visible weekly content without an in-page measurement replica", async () => {
++  it("renders visible weekly content with an inert in-page measurement replica", async () => {
+     const bootstrap = bootstrapWithTwoProfiles();
+     bootstrap.profiles[0]!.accountDisplayName = "ProofUser@example.com";
+     bootstrap.profiles[0]!.accountEmail = "stack@example.com";
+@@ -78,7 +111,7 @@
+       "account-avatar://profile/a?rev=1",
+     );
+ 
+-    expect(screen.queryByTestId("taskbar-status-measurement")).toBeNull();
++    expect(screen.getByTestId("taskbar-status-measurement")).toHaveAttribute("aria-hidden", "true");
+     expect(screen.getAllByRole("button")).toHaveLength(1);
+     expect(
+       invokeMock.mock.calls.some(([command]) => command === "set_taskbar_status_width"),
+@@ -190,7 +223,7 @@
+     expect(await within(visible).findByText(/周 98%|Wk 98%/)).toBeVisible();
+     expect(within(visible).getByText("ProofU")).toBeVisible();
+     expect(within(visible).getByText("8/20")).toBeVisible();
+-    expect(screen.queryByTestId("taskbar-status-measurement")).toBeNull();
++    expect(screen.getByTestId("taskbar-status-measurement")).toHaveAttribute("aria-hidden", "true");
+   });
+ 
+   it("renders only the universal weekly metric from a multi-window payload", async () => {
+--- a/apps/desktop-tauri/src/surfaces/TaskbarStatus.tsx
++++ b/apps/desktop-tauri/src/surfaces/TaskbarStatus.tsx
+@@ -1,4 +1,6 @@
++import { useRef } from "react";
+ import { useStatusSurface } from "../hooks/useStatusSurface";
++import { useTaskbarStatusWidth } from "../hooks/useTaskbarStatusWidth";
+ import { useTheme } from "../hooks/useTheme";
+ import { TaskbarStatusContents } from "./TaskbarStatusContents";
+ import { buildTaskbarStatusPresentation } from "./taskbarStatusPresentation";
+@@ -9,6 +11,8 @@
+   useTheme(surface.bootstrap?.settings.theme ?? "system");
+   const presentation = buildTaskbarStatusPresentation(surface);
+   const closeFailed = surface.closeFailedBySurface.taskbarStatus;
++  const measurementRef = useRef<HTMLDivElement>(null);
++  useTaskbarStatusWidth(measurementRef);
+ 
+   return (
+     <div className="taskbar-status-host" data-testid="taskbar-status-content">
+@@ -18,6 +22,11 @@
+         closeFailed={closeFailed}
+         onOpen={() => void surface.openPanel()}
+       />
++      <TaskbarStatusContents
++        mode="measurement"
++        presentation={presentation}
++        measurementRef={measurementRef}
++      />
+     </div>
+   );
+ }
+--- a/apps/desktop-tauri/src/surfaces/TaskbarStatusMeasure.test.tsx
++++ /dev/null
+@@ -1,211 +0,0 @@
+-import { render, screen, waitFor, within } from "@testing-library/react";
+-// @ts-ignore Vitest executes tests in Node; the browser build does not include test modules.
+-import { readFileSync } from "node:fs";
+-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+-import { invokeMock } from "../test/setup";
+-import {
+-  bootstrapWithTwoProfiles,
+-  weeklyOnlyUsage,
+-} from "../test/profileUsageFixtures";
+-import TaskbarStatus from "./TaskbarStatus";
+-import TaskbarStatusMeasure from "./TaskbarStatusMeasure";
+-
+-const taskbarStatusCss = readFileSync("src/surfaces/TaskbarStatus.css", "utf8");
+-
+-describe("TaskbarStatusMeasure", () => {
+-  beforeEach(() => invokeMock.mockReset());
+-
+-  afterEach(() => {
+-    vi.unstubAllGlobals();
+-    vi.restoreAllMocks();
+-  });
+-
+-  it("keeps helper content intrinsic, capped, and off-screen", () => {
+-    const start = taskbarStatusCss.indexOf(".taskbar-status--measurement {");
+-    const rule = taskbarStatusCss.slice(start, taskbarStatusCss.indexOf("}", start));
+-    expect(rule).toContain("position: fixed");
+-    expect(rule).toContain("left: -10000px");
+-    expect(rule).toContain("width: max-content");
+-    expect(rule).toContain("max-width: 318px");
+-    expect(rule).not.toContain("display: none");
+-    expect(rule).not.toContain("content-visibility: hidden");
+-  });
+-
+-  it("renders only inert weekly measurement geometry", async () => {
+-    const bootstrap = bootstrapWithTwoProfiles();
+-    bootstrap.profiles[0]!.accountDisplayName = "ProofUser";
+-    bootstrap.profiles[0]!.presentationName = "ProofUser";
+-    bootstrap.usageByProfile.personal = weeklyOnlyUsage();
+-    invokeMock.mockResolvedValue(bootstrap);
+-
+-    render(<TaskbarStatusMeasure />);
+-
+-    const measurement = await screen.findByTestId("taskbar-status-measurement");
+-    expect(await within(measurement).findByText(/周 98%|Wk 98%/)).toBeInTheDocument();
+-    expect(within(measurement).getByText("ProofU")).toBeInTheDocument();
+-    expect(within(measurement).getByText("8/20")).toBeInTheDocument();
+-    expect(within(measurement).queryByText(/5H/)).toBeNull();
+-    expect(measurement).toHaveAttribute("aria-hidden", "true");
+-    expect(measurement).toHaveAttribute("inert");
+-    expect(screen.queryByTestId("taskbar-status-visible")).toBeNull();
+-  });
+-
+-  it("uses the same transparency-derived alpha on the independent measurement root", async () => {
+-    const bootstrap = bootstrapWithTwoProfiles();
+-    bootstrap.settings.taskbarTransparencyPercent = 80;
+-    invokeMock.mockResolvedValue(bootstrap);
+-    render(<TaskbarStatusMeasure />);
+-
+-    const measurement = await screen.findByTestId("taskbar-status-measurement");
+-    await waitFor(() =>
+-      expect(measurement.style.getPropertyValue("--surface-bg-alpha")).toBe("0.2"),
+-    );
+-  });
+-
+-  it("keeps the rendered root alpha from being shadowed by a descendant fallback", async () => {
+-    const bootstrap = bootstrapWithTwoProfiles();
+-    bootstrap.settings.taskbarTransparencyPercent = 80;
+-    invokeMock.mockResolvedValue(bootstrap);
+-    render(<TaskbarStatusMeasure />);
+-
+-    const measurement = await screen.findByTestId("taskbar-status-measurement");
+-    await waitFor(() =>
+-      expect(measurement.style.getPropertyValue("--surface-bg-alpha")).toBe("0.2"),
+-    );
+-    for (const descendant of measurement.querySelectorAll<HTMLElement>("*")) {
+-      expect(descendant.style.getPropertyValue("--surface-bg-alpha")).toBe("");
+-    }
+-
+-    const alphaDeclarationSelectors = Array.from(
+-      taskbarStatusCss.matchAll(/([^{}]+)\{[^{}]*--surface-bg-alpha\s*:[^{}]*\}/g),
+-      ([, selector]) => selector.trim(),
+-    );
+-    expect(alphaDeclarationSelectors).toEqual([".taskbar-status"]);
+-  });
+-
+-  it("renders the exact visible geometry sequence without a close column", async () => {
+-    const bootstrap = bootstrapWithTwoProfiles();
+-    bootstrap.profiles[0]!.accountDisplayName = "ProofUser";
+-    bootstrap.profiles[0]!.presentationName = "ProofUser";
+-    bootstrap.profiles[0]!.avatarKind = "manual";
+-    bootstrap.profiles[0]!.avatarAssetUri =
+-      "account-avatar://profile/a?rev=1";
+-    bootstrap.usageByProfile.personal = weeklyOnlyUsage();
+-    invokeMock.mockResolvedValue(bootstrap);
+-
+-    const visibleView = render(<TaskbarStatus />);
+-    const visible = await screen.findByTestId("taskbar-status-visible");
+-    await within(visible).findByText(/周 98%|Wk 98%/);
+-    const geometry = (root: HTMLElement) =>
+-      Array.from(
+-        root.querySelectorAll(
+-          ".taskbar-status__avatar, .taskbar-status__identity, .taskbar-status__metric, .taskbar-status__reset",
+-        ),
+-      ).map((element) => `${element.className}:${element.textContent}`);
+-    const visibleGeometry = geometry(visible);
+-    const visibleAvatar = {
+-      kind: visible.querySelector(".account-avatar")?.getAttribute("data-avatar-kind"),
+-      src: visible.querySelector("img")?.getAttribute("src"),
+-    };
+-    visibleView.unmount();
+-
+-    const measurementView = render(<TaskbarStatusMeasure />);
+-    const measurement = await screen.findByTestId("taskbar-status-measurement");
+-    await within(measurement).findByText(/周 98%|Wk 98%/);
+-    const measurementGeometry = geometry(measurement);
+-    expect(measurementGeometry).toEqual(visibleGeometry);
+-    expect({
+-      kind: measurement
+-        .querySelector(".account-avatar")
+-        ?.getAttribute("data-avatar-kind"),
+-      src: measurement.querySelector("img")?.getAttribute("src"),
+-    }).toEqual(visibleAvatar);
+-    expect(visibleAvatar).toEqual({
+-      kind: "manual",
+-      src: "account-avatar://profile/a?rev=1",
+-    });
+-    expect(visibleGeometry).toEqual([
+-      "taskbar-status__avatar:",
+-      "taskbar-status__identity:ProofU",
+-      "taskbar-status__metric:Wk 98%",
+-      "taskbar-status__reset:8/20",
+-    ]);
+-    measurementView.unmount();
+-  });
+-
+-  it("keeps visible and measurement geometry identical under filtered preferences", async () => {
+-    const bootstrap = bootstrapWithTwoProfiles();
+-    bootstrap.profiles[0]!.accountDisplayName = "ProofUser";
+-    bootstrap.profiles[0]!.presentationName = "ProofUser";
+-    bootstrap.usageByProfile.personal = weeklyOnlyUsage();
+-    bootstrap.settings.taskbarPresentation = {
+-      ...bootstrap.settings.taskbarPresentation,
+-      showTaskbarIcon: false,
+-      showTaskbarAccount: false,
+-      showWeeklyLabel: false,
+-      showWeeklyPercent: true,
+-      showResetDate: false,
+-    };
+-    invokeMock.mockResolvedValue(bootstrap);
+-
+-    const visibleView = render(<TaskbarStatus />);
+-    const visible = await screen.findByTestId("taskbar-status-visible");
+-    await within(visible).findByText("98%");
+-    const geometry = (root: HTMLElement) =>
+-      Array.from(
+-        root.querySelectorAll(
+-          ".taskbar-status__avatar, .taskbar-status__identity, .taskbar-status__metric, .taskbar-status__reset",
+-        ),
+-      ).map((element) => `${element.className}:${element.textContent}`);
+-    const visibleGeometry = geometry(visible);
+-    visibleView.unmount();
+-
+-    const measurementView = render(<TaskbarStatusMeasure />);
+-    const measurement = await screen.findByTestId("taskbar-status-measurement");
+-    await within(measurement).findByText("98%");
+-    expect(geometry(measurement)).toEqual(visibleGeometry);
+-    expect(visibleGeometry).toEqual(["taskbar-status__metric:98%"]);
+-    measurementView.unmount();
+-  });
+-
+-  it("owns the only ResizeObserver and submits a 247px measurement exactly once", async () => {
+-    class ResizeObserverStub {
+-      static instances: ResizeObserverStub[] = [];
+-      readonly observe = vi.fn();
+-      readonly disconnect = vi.fn();
+-
+-      constructor(_callback: ResizeObserverCallback) {
+-        ResizeObserverStub.instances.push(this);
+-      }
+-    }
+-    vi.stubGlobal("ResizeObserver", ResizeObserverStub);
+-    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({
+-      width: 279,
+-    } as DOMRect);
+-    vi.spyOn(HTMLElement.prototype, "scrollWidth", "get").mockReturnValue(247);
+-    const bootstrap = bootstrapWithTwoProfiles();
+-    invokeMock.mockImplementation(async (command: string) =>
+-      command === "get_bootstrap_state" ? bootstrap : undefined,
+-    );
+-
+-    render(<TaskbarStatusMeasure />);
+-
+-    await screen.findByTestId("taskbar-status-measurement");
+-    await vi.waitFor(() =>
+-      expect(invokeMock).toHaveBeenCalledWith("set_taskbar_status_width", {
+-        width: 295,
+-      }),
+-    );
+-    expect(ResizeObserverStub.instances).toHaveLength(1);
+-    expect(
+-      invokeMock.mock.calls.filter(([command]) => command === "set_taskbar_status_width"),
+-    ).toHaveLength(1);
+-  });
+-
+-  it("disables close-error animation when reduced motion is requested", () => {
+-    expect(taskbarStatusCss).toMatch(
+-      /@media\s*\(prefers-reduced-motion:\s*reduce\)[\s\S]*?\.taskbar-status__close\[data-error="true"\]\s*\{\s*animation:\s*none;?\s*\}/,
+-    );
+-  });
+-});
+-
+--- a/apps/desktop-tauri/src/surfaces/TaskbarStatusMeasure.tsx
++++ /dev/null
+@@ -1,23 +0,0 @@
+-import { useRef } from "react";
+-import { useStatusSurface } from "../hooks/useStatusSurface";
+-import { useTheme } from "../hooks/useTheme";
+-import { useTaskbarStatusWidth } from "../hooks/useTaskbarStatusWidth";
+-import { TaskbarStatusContents } from "./TaskbarStatusContents";
+-import { buildTaskbarStatusPresentation } from "./taskbarStatusPresentation";
+-import "./TaskbarStatus.css";
+-
+-export default function TaskbarStatusMeasure() {
+-  const surface = useStatusSurface();
+-  useTheme(surface.bootstrap?.settings.theme ?? "system");
+-  const presentation = buildTaskbarStatusPresentation(surface);
+-  const measurementRef = useRef<HTMLDivElement>(null);
+-  useTaskbarStatusWidth(measurementRef);
+-
+-  return (
+-    <TaskbarStatusContents
+-      mode="measurement"
+-      presentation={presentation}
+-      measurementRef={measurementRef}
+-    />
+-  );
+-}
+--- /dev/null
++++ b/apps/desktop-tauri/src/surfaces/TrayHost.test.tsx
+@@ -0,0 +1,69 @@
++import { act, render, screen, waitFor } from "@testing-library/react";
++import { useEffect } from "react";
++import { beforeEach, describe, expect, it, vi } from "vitest";
++
++const harness = vi.hoisted(() => ({
++  callback: undefined as undefined | ((event: { payload: boolean }) => void),
++  isVisible: vi.fn(),
++  listen: vi.fn(),
++  stop: vi.fn(),
++  mount: vi.fn(),
++  cleanup: vi.fn(),
++}));
++vi.mock("@tauri-apps/api/event", () => ({ listen: (...args: unknown[]) => harness.listen(...args) }));
++vi.mock("@tauri-apps/api/webviewWindow", () => ({
++  getCurrentWebviewWindow: () => ({ isVisible: harness.isVisible }),
++}));
++vi.mock("./TrayPanel", () => ({ default: function Panel() {
++  useEffect(() => { harness.mount(); return harness.cleanup; }, []);
++  return <div>Live dashboard</div>;
++} }));
++import TrayHost from "./TrayHost";
++
++describe("TrayHost lifecycle", () => {
++  beforeEach(() => {
++    vi.clearAllMocks();
++    harness.callback = undefined;
++    harness.isVisible.mockResolvedValue(false);
++    harness.listen.mockImplementation(async (_: string, callback: typeof harness.callback) => {
++      harness.callback = callback;
++      return harness.stop;
++    });
++  });
++
++  it("does no dashboard work while hidden, unmounts on hide, and reloads on show", async () => {
++    const host = render(<TrayHost />);
++    await waitFor(() => expect(harness.isVisible).toHaveBeenCalledOnce());
++    expect(harness.mount).not.toHaveBeenCalled();
++    act(() => harness.callback?.({ payload: true }));
++    expect(screen.getByText("Live dashboard")).toBeInTheDocument();
++    act(() => harness.callback?.({ payload: false }));
++    expect(screen.queryByText("Live dashboard")).toBeNull();
++    expect(harness.cleanup).toHaveBeenCalledOnce();
++    act(() => harness.callback?.({ payload: true }));
++    expect(harness.mount).toHaveBeenCalledTimes(2);
++    host.unmount();
++    expect(harness.stop).toHaveBeenCalledOnce();
++    expect(harness.cleanup).toHaveBeenCalledTimes(2);
++  });
++
++  it("does not let a stale initial visibility response undo a newer hide event", async () => {
++    let resolve!: (visible: boolean) => void;
++    harness.isVisible.mockImplementation(() => new Promise<boolean>(done => { resolve = done; }));
++    render(<TrayHost />);
++    await waitFor(() => expect(harness.isVisible).toHaveBeenCalledOnce());
++    act(() => harness.callback?.({ payload: false }));
++    await act(async () => resolve(true));
++    expect(harness.mount).not.toHaveBeenCalled();
++  });
++
++  it("cleans up a listener whose registration finishes after unmount", async () => {
++    let resolve!: (stop: () => void) => void;
++    harness.listen.mockImplementation(() => new Promise<() => void>(done => { resolve = done; }));
++    const host = render(<TrayHost />);
++    host.unmount();
++    await act(async () => resolve(harness.stop));
++    expect(harness.stop).toHaveBeenCalledOnce();
++    expect(harness.isVisible).not.toHaveBeenCalled();
++  });
++});
+--- /dev/null
++++ b/apps/desktop-tauri/src/surfaces/TrayHost.tsx
+@@ -0,0 +1,33 @@
++import { useEffect, useState } from "react";
++import { listen } from "@tauri-apps/api/event";
++import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
++import TrayPanel from "./TrayPanel";
++
++/** Keep only the visibility listener alive while the native panel is hidden. */
++export default function TrayHost() {
++  const [visible, setVisible] = useState(false);
++  useEffect(() => {
++    let active = true;
++    let revision = 0;
++    let stop: (() => void) | undefined;
++    const start = async () => {
++      try {
++        const unlisten = await listen<boolean>("codexbar:tray-visibility", ({ payload }) => {
++          if (!active) return;
++          revision++;
++          setVisible(payload);
++        });
++        if (!active) { unlisten(); return; }
++        stop = unlisten;
++        const observed = revision;
++        const current = await getCurrentWebviewWindow().isVisible();
++        if (active && revision === observed) setVisible(current);
++      } catch {
++        // A later native show event can recover without mounting a hidden dashboard.
++      }
++    };
++    void start();
++    return () => { active = false; stop?.(); };
++  }, []);
++  return visible ? <TrayPanel /> : null;
++}
+--- a/apps/desktop-tauri/src/surfaces/settings/tabs/UsageSpendTab.test.tsx
++++ b/apps/desktop-tauri/src/surfaces/settings/tabs/UsageSpendTab.test.tsx
+@@ -83,6 +83,32 @@
+ }
+ 
+ describe("UsageSpendTab", () => {
++  it("bounds formatter creation and skips unchanged statistics on parent updates", async () => {
++    const payload = dto();
++    const activity = payload.local.activity;
++    const readActivity = vi.fn(() => activity);
++    Object.defineProperty(payload.local, "activity", { get: readActivity });
++    getUsageSpendMock.mockResolvedValue(payload);
++    const constructor = vi.spyOn(Intl, "DateTimeFormat");
++    const copy = settingsCopy("en-US");
++    try {
++      const view = render(<UsageSpendTab copy={copy} language="en-US" />);
++      await screen.findByRole("grid");
++      expect(constructor.mock.calls.length).toBeLessThanOrEqual(4);
++      readActivity.mockClear();
++      constructor.mockClear();
++      view.rerender(<UsageSpendTab copy={copy} language="en-US" />);
++      expect(readActivity).not.toHaveBeenCalled();
++      // A real prop change must still render, but reuse all existing formatters.
++      view.rerender(<UsageSpendTab copy={{ ...copy }} language="en-US" />);
++      expect(readActivity).toHaveBeenCalled();
++      expect(constructor).not.toHaveBeenCalled();
++      expect(getUsageSpendMock).toHaveBeenCalledOnce();
++    } finally {
++      constructor.mockRestore();
++    }
++  });
++
+   beforeEach(() => {
+     getUsageSpendMock.mockReset();
+   });
+--- a/apps/desktop-tauri/src/surfaces/settings/tabs/UsageSpendTab.tsx
++++ b/apps/desktop-tauri/src/surfaces/settings/tabs/UsageSpendTab.tsx
+@@ -1,4 +1,4 @@
+-import { useCallback, useEffect, useRef, useState } from "react";
++import { memo, useCallback, useEffect, useRef, useState } from "react";
+ import { getUsageSpend } from "../../../lib/tauri";
+ import { resolveLanguage } from "../../../lib/resolveLanguage";
+ import type {
+@@ -7,6 +7,26 @@
+ } from "../../../types/bridge";
+ import type { SettingsCopy } from "../settingsCopy";
+ 
++type DateStyle = "short" | "long" | "month" | "time";
++const DATE_OPTIONS: Record<DateStyle, Intl.DateTimeFormatOptions> = {
++  short: { month: "short", day: "numeric" },
++  long: { year: "numeric", month: "short", day: "numeric" },
++  month: { month: "short" },
++  time: { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" },
++};
++// Two supported locales, four fixed styles: at most eight native ICU formatters.
++const dateFormatters = new Map<string, Intl.DateTimeFormat>();
++function dateFormatter(language: string, style: DateStyle): Intl.DateTimeFormat {
++  const locale = resolveLanguage(language);
++  const key = `${locale}:${style}`;
++  let formatter = dateFormatters.get(key);
++  if (!formatter) {
++    formatter = new Intl.DateTimeFormat(locale, DATE_OPTIONS[style]);
++    dateFormatters.set(key, formatter);
++  }
++  return formatter;
++}
++
+ const RANGES: readonly UsageSpendRange[] = [
+   "today",
+   "last7Days",
+@@ -18,20 +38,13 @@
+ function formatDate(date: string, language: string): string {
+   const parsed = new Date(`${date}T00:00:00`);
+   if (Number.isNaN(parsed.getTime())) return date;
+-  return new Intl.DateTimeFormat(resolveLanguage(language), {
+-    month: "short",
+-    day: "numeric",
+-  }).format(parsed);
++  return dateFormatter(language, "short").format(parsed);
+ }
+ 
+ function formatLongDate(date: string, language: string): string {
+   const parsed = new Date(`${date}T00:00:00`);
+   if (Number.isNaN(parsed.getTime())) return date;
+-  return new Intl.DateTimeFormat(resolveLanguage(language), {
+-    year: "numeric",
+-    month: "short",
+-    day: "numeric",
+-  }).format(parsed);
++  return dateFormatter(language, "long").format(parsed);
+ }
+ 
+ export function formatTokenCount(value: number, language: string): string {
+@@ -85,10 +98,7 @@
+   cells: Array<string | null>,
+   language: string,
+ ): Array<{ column: number; label: string }> {
+-  const formatter = new Intl.DateTimeFormat(
+-    resolveLanguage(language),
+-    { month: "short" },
+-  );
++  const formatter = dateFormatter(language, "month");
+   let previousMonth = "";
+   return cells.reduce<Array<{ column: number; label: string }>>(
+     (labels, date, index) => {
+@@ -110,12 +120,7 @@
+   if (!value) return "—";
+   const parsed = new Date(value);
+   if (Number.isNaN(parsed.getTime())) return value;
+-  return new Intl.DateTimeFormat(resolveLanguage(language), {
+-    month: "short",
+-    day: "numeric",
+-    hour: "2-digit",
+-    minute: "2-digit",
+-  }).format(parsed);
++  return dateFormatter(language, "time").format(parsed);
+ }
+ 
+ function formatCost(cost: { amount: number | null; provenance: string } | undefined, usageCopy: SettingsCopy["usageSpend"]): string {
+@@ -129,7 +134,7 @@
+   return `cost-${Math.min(4, Math.max(1, Math.ceil((amount / maxCost) * 4)))}`;
+ }
+ 
+-export default function UsageSpendTab({
++function UsageSpendTab({
+   copy,
+   language,
+ }: {
+@@ -453,3 +458,6 @@
+     </section>
+   );
+ }
++
++// Quota refreshes in Settings must not rebuild unchanged local statistics.
++export default memo(UsageSpendTab);

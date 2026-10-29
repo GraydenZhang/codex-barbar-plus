@@ -24,7 +24,7 @@ jobs:
 
       - name: Apply focused Plus changes
         shell: pwsh
-        run: python scripts/apply_plus.py --source upstream --overlay . --version 1.0.30-plus.5
+        run: python scripts/apply_plus.py --source upstream --overlay . --version 0.2.0
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -56,6 +56,23 @@ jobs:
         shell: pwsh
         run: pnpm --dir upstream/apps/desktop-tauri run build
 
+      - name: Test frontend interactions
+        shell: pwsh
+        run: pnpm --dir upstream/apps/desktop-tauri test
+
+      - name: Test usage, settings, and task tracking
+        working-directory: upstream
+        shell: pwsh
+        run: |
+          cargo test -p codexbar usage_spend::tests --lib
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test -p codexbar storage::settings_repository::tests --lib
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test -p codex-barbar-desktop shell::fullscreen_guard::tests
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test -p codex-barbar-desktop desktop_tasks::tests
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Check Rust integration
         working-directory: upstream
         shell: pwsh
@@ -72,22 +89,33 @@ jobs:
           $stage = Join-Path $out 'portable'
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
 
-          Copy-Item 'upstream\target\release\codex-barbar.exe' (Join-Path $stage 'codex-barbar.exe')
+          $exe = 'upstream\target\release\codex-barbar.exe'
+          $webViewLoader = 'upstream\target\release\WebView2Loader.dll'
+          if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
+            throw "portable executable missing: $exe"
+          }
+          if (-not (Test-Path -LiteralPath $webViewLoader -PathType Leaf)) {
+            throw "portable runtime dependency missing: $webViewLoader"
+          }
+          Copy-Item $exe (Join-Path $stage 'codex-barbar.exe')
+          Copy-Item $webViewLoader (Join-Path $stage 'WebView2Loader.dll')
           foreach ($doc in @('LICENSE','UPSTREAMS.md','README.md','README.zh-CN.md','PORTABLE.md')) {
             Copy-Item (Join-Path 'upstream' $doc) (Join-Path $stage $doc)
           }
           Copy-Item 'README-PLUS.md' (Join-Path $stage 'README-PLUS.md')
+          New-Item -ItemType Directory -Force -Path (Join-Path $stage 'docs') | Out-Null
+          Copy-Item 'docs/*.md' (Join-Path $stage 'docs')
 
-          $zip = Join-Path $out 'codex-barbar-plus_1.0.30-plus.5_x64-portable.zip'
+          $zip = Join-Path $out 'codex-barbar-plus_0.2.0_x64-portable.zip'
           Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip -CompressionLevel Optimal -Force
           $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
-          "$hash  codex-barbar-plus_1.0.30-plus.5_x64-portable.zip" | Set-Content -Encoding ascii (Join-Path $out 'SHA256SUMS.txt')
+          "$hash  codex-barbar-plus_0.2.0_x64-portable.zip" | Set-Content -Encoding ascii (Join-Path $out 'SHA256SUMS.txt')
 
       - name: Upload portable
         uses: actions/upload-artifact@v4
         with:
           name: codex-barbar-plus-windows-x64-portable
           path: |
-            artifacts/codex-barbar-plus_1.0.30-plus.5_x64-portable.zip
+            artifacts/codex-barbar-plus_0.2.0_x64-portable.zip
             artifacts/SHA256SUMS.txt
           if-no-files-found: error

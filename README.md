@@ -4,9 +4,19 @@ Personal Windows enhancements built **on top of `naipi11/codex-barbar` v1.0.30**
 The overlay intentionally preserves the upstream Tauri/React/Rust shell and its
 existing visual design rather than reimplementing the app.
 
+Current Plus release: **v0.2.0**. This version fixes the taskbar status being
+hidden when Codex Desktop is maximized, and retains the local Plus.6/Plus.7
+notification, task tracking and memory fixes. See
+[`docs/fix-maximized-taskbar-v0.2.0.md`](docs/fix-maximized-taskbar-v0.2.0.md).
+
+Local build: `python scripts/apply_plus.py --source upstream --overlay .`, then
+`./scripts/build-portable.ps1`. The generated full source is in `upstream/`;
+the reproducible changes are kept in `overrides/` and `scripts/`.
+
 ## Changes
 
-- Taskbar capsule keeps the original design but removes the account name.
+- Taskbar capsule keeps the original design; its account-name setting works
+  independently of the optional 5-hour quota display.
 - Taskbar shows the **5-hour quota + its local reset time** and the **weekly quota + reset date**.
 - Tray panel adds a **Pin / 置顶** button. Pinning prevents the panel from auto-hiding when it loses focus; all other upstream window behavior is retained.
 - Reads local Codex Desktop session JSONL files under `%USERPROFILE%\.codex\sessions` and shows compact task state only while there are relevant tasks:

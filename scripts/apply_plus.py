@@ -10,6 +10,11 @@ import argparse
 import shutil
 from pathlib import Path
 
+from audit_usage import apply as patch_audit_usage
+from audit_ui import apply as patch_audit_ui
+from audit_settings import apply as patch_audit_settings
+from memory_fixes import apply as patch_memory_fixes
+
 
 def replace_once(path: Path, old: str, new: str, label: str) -> None:
     text = path.read_text(encoding="utf-8-sig")
@@ -447,6 +452,877 @@ def patch_notification_labels(source: Path) -> None:
             raise RuntimeError(f"notification reset label: expected one {old!r}, got {count}")
         text = text.replace(old, new, 1)
     path.write_text(text, encoding="utf-8")
+
+
+def patch_reset_notification_sound_storage(source: Path) -> None:
+    path = source / "rust/src/storage/settings_repository.rs"
+    replace_once(
+        path,
+        "#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]\n"
+        "#[serde(rename_all = \"camelCase\", default)]\n"
+        "pub struct NotificationPreferences {\n",
+        "#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]\n"
+        "#[serde(rename_all = \"camelCase\")]\n"
+        "pub enum NotificationSound {\n"
+        "    Default,\n"
+        "    Im,\n"
+        "    Mail,\n"
+        "    Reminder,\n"
+        "    Sms,\n"
+        "}\n\n"
+        "impl NotificationSound {\n"
+        "    pub fn id(self) -> &'static str {\n"
+        "        match self {\n"
+        "            Self::Default => \"default\",\n"
+        "            Self::Im => \"im\",\n"
+        "            Self::Mail => \"mail\",\n"
+        "            Self::Reminder => \"reminder\",\n"
+        "            Self::Sms => \"sms\",\n"
+        "        }\n"
+        "    }\n\n"
+        "    pub fn from_id(value: &str) -> Result<Self, String> {\n"
+        "        match value {\n"
+        "            \"default\" => Ok(Self::Default),\n"
+        "            \"im\" => Ok(Self::Im),\n"
+        "            \"mail\" => Ok(Self::Mail),\n"
+        "            \"reminder\" => Ok(Self::Reminder),\n"
+        "            \"sms\" => Ok(Self::Sms),\n"
+        "            _ => Err(\"unsupported notification sound\".to_string()),\n"
+        "        }\n"
+        "    }\n\n"
+        "    pub fn toast_uri(self) -> &'static str {\n"
+        "        match self {\n"
+        "            Self::Default => \"ms-winsoundevent:Notification.Default\",\n"
+        "            Self::Im => \"ms-winsoundevent:Notification.IM\",\n"
+        "            Self::Mail => \"ms-winsoundevent:Notification.Mail\",\n"
+        "            Self::Reminder => \"ms-winsoundevent:Notification.Reminder\",\n"
+        "            Self::Sms => \"ms-winsoundevent:Notification.SMS\",\n"
+        "        }\n"
+        "    }\n"
+        "}\n\n"
+        "impl Default for NotificationSound {\n"
+        "    fn default() -> Self {\n"
+        "        Self::Default\n"
+        "    }\n"
+        "}\n\n"
+        "#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]\n"
+        "#[serde(rename_all = \"camelCase\", default)]\n"
+        "pub struct NotificationPreferences {\n",
+        "notification sound enum",
+    )
+    replace_once(
+        path,
+        "    pub play_sound: bool,\n    pub warning_enabled: bool,",
+        "    pub play_sound: bool,\n    pub reset_sound: NotificationSound,\n    pub warning_enabled: bool,",
+        "notification reset sound preference",
+    )
+    replace_once(
+        path,
+        "            play_sound: true,\n            warning_enabled: true,",
+        "            play_sound: true,\n            reset_sound: NotificationSound::Default,\n            warning_enabled: true,",
+        "notification reset sound default",
+    )
+    replace_once(
+        path,
+        "    pub play_sound: Option<bool>,\n    pub warning_enabled: Option<bool>,",
+        "    pub play_sound: Option<bool>,\n    pub reset_sound: Option<NotificationSound>,\n    pub warning_enabled: Option<bool>,",
+        "notification reset sound patch field",
+    )
+    replace_once(
+        path,
+        "        if let Some(value) = self.play_sound {\n"
+        "            preferences.play_sound = value;\n"
+        "        }\n"
+        "        if let Some(value) = self.warning_enabled {",
+        "        if let Some(value) = self.play_sound {\n"
+        "            preferences.play_sound = value;\n"
+        "        }\n"
+        "        if let Some(value) = self.reset_sound {\n"
+        "            preferences.reset_sound = value;\n"
+        "        }\n"
+        "        if let Some(value) = self.warning_enabled {",
+        "apply notification reset sound patch",
+    )
+    replace_once(
+        path,
+        "        assert!(notifications.play_sound);\n"
+        "        assert!(notifications.warning_enabled);",
+        "        assert!(notifications.play_sound);\n"
+        "        assert_eq!(notifications.reset_sound, NotificationSound::Default);\n"
+        "        assert!(notifications.warning_enabled);",
+        "notification reset sound compatibility assertion",
+    )
+    replace_once(
+        path,
+        "                    enabled: Some(true),\n"
+        "                    play_sound: Some(false),\n"
+        "                    warning_enabled: Some(false),",
+        "                    enabled: Some(true),\n"
+        "                    play_sound: Some(false),\n"
+        "                    reset_sound: Some(NotificationSound::Mail),\n"
+        "                    warning_enabled: Some(false),",
+        "notification reset sound repository patch test",
+    )
+    replace_once(
+        path,
+        "        assert_eq!(reloaded.notifications.warning_remaining_percent, 70);",
+        "        assert_eq!(reloaded.notifications.warning_remaining_percent, 70);\n"
+        "        assert_eq!(reloaded.notifications.reset_sound, NotificationSound::Mail);",
+        "notification reset sound repository assertion",
+    )
+
+    path = source / "rust/src/storage/mod.rs"
+    replace_once(
+        path,
+        "    AppSettings, DisplayMode, LanguagePreference, NotificationPreferences,\n"
+        "    NotificationPreferencesPatch, PanelDensity, PanelPreferences, PanelPreferencesPatch,\n"
+        "    SettingsPatch, SettingsRepository, SurfaceAppearancePreferences, TaskbarDensity,\n"
+        "    TaskbarPresentationPreferences, TaskbarTrayPreferences, TaskbarTrayPreferencesPatch,\n"
+        "    ThemePreference, TrayIconMode,",
+        "    AppSettings, DisplayMode, LanguagePreference, NotificationPreferences,\n"
+        "    NotificationPreferencesPatch, NotificationSound, PanelDensity, PanelPreferences,\n"
+        "    PanelPreferencesPatch, SettingsPatch, SettingsRepository, SurfaceAppearancePreferences,\n"
+        "    TaskbarDensity, TaskbarPresentationPreferences, TaskbarTrayPreferences,\n"
+        "    TaskbarTrayPreferencesPatch, ThemePreference, TrayIconMode,",
+        "notification sound public storage export",
+    )
+
+
+def patch_reset_notification_sound_bridge(source: Path) -> None:
+    path = source / "apps/desktop-tauri/src-tauri/src/commands/bridge.rs"
+    replace_once(
+        path,
+        "    NotificationPreferences, NotificationPreferencesPatch, PanelDensity, PanelPreferences,\n"
+        "    PanelPreferencesPatch, SettingsPatch, TaskbarDensity, TaskbarPresentationPreferences,\n"
+        "    TaskbarTrayPreferencesPatch, ThemePreference,",
+        "    NotificationPreferences, NotificationPreferencesPatch, NotificationSound, PanelDensity,\n"
+        "    PanelPreferences, PanelPreferencesPatch, SettingsPatch, TaskbarDensity,\n"
+        "    TaskbarPresentationPreferences, TaskbarTrayPreferencesPatch, ThemePreference,",
+        "notification sound bridge import",
+    )
+    replace_once(
+        path,
+        "    pub play_sound: bool,\n    pub warning_enabled: bool,",
+        "    pub play_sound: bool,\n    pub reset_sound: &'static str,\n    pub warning_enabled: bool,",
+        "notification sound dto field",
+    )
+    replace_once(
+        path,
+        "            play_sound: preferences.play_sound,\n"
+        "            warning_enabled: preferences.warning_enabled,",
+        "            play_sound: preferences.play_sound,\n"
+        "            reset_sound: preferences.reset_sound.id(),\n"
+        "            warning_enabled: preferences.warning_enabled,",
+        "notification sound dto mapping",
+    )
+    replace_once(
+        path,
+        "    pub play_sound: Option<bool>,\n    pub warning_enabled: Option<bool>,",
+        "    pub play_sound: Option<bool>,\n    pub reset_sound: Option<String>,\n    pub warning_enabled: Option<bool>,",
+        "notification sound patch dto",
+    )
+    replace_once(
+        path,
+        "        Ok(NotificationPreferencesPatch {\n"
+        "            enabled: self.enabled,\n"
+        "            play_sound: self.play_sound,\n"
+        "            warning_enabled: self.warning_enabled,",
+        "        let reset_sound = self\n"
+        "            .reset_sound\n"
+        "            .map(|value| NotificationSound::from_id(&value))\n"
+        "            .transpose()?;\n"
+        "        Ok(NotificationPreferencesPatch {\n"
+        "            enabled: self.enabled,\n"
+        "            play_sound: self.play_sound,\n"
+        "            reset_sound,\n"
+        "            warning_enabled: self.warning_enabled,",
+        "notification sound patch mapping",
+    )
+
+    path = source / "apps/desktop-tauri/src-tauri/src/commands/settings.rs"
+    replace_once(
+        path,
+        "            notifications: Some(NotificationPreferencesPatchDto {\n"
+        "                enabled: Some(true),\n"
+        "                play_sound: Some(false),\n"
+        "                warning_enabled: Some(false),",
+        "            notifications: Some(NotificationPreferencesPatchDto {\n"
+        "                enabled: Some(true),\n"
+        "                play_sound: Some(false),\n"
+        "                reset_sound: Some(\"reminder\".to_string()),\n"
+        "                warning_enabled: Some(false),",
+        "notification sound settings command input test",
+    )
+    replace_once(
+        path,
+        "            Some(NotificationPreferencesPatch {\n"
+        "                enabled: Some(true),\n"
+        "                play_sound: Some(false),\n"
+        "                warning_enabled: Some(false),",
+        "            Some(NotificationPreferencesPatch {\n"
+        "                enabled: Some(true),\n"
+        "                play_sound: Some(false),\n"
+        "                reset_sound: Some(NotificationSound::Reminder),\n"
+        "                warning_enabled: Some(false),",
+        "notification sound settings command expectation",
+    )
+
+    path = source / "apps/desktop-tauri/src/types/bridge.ts"
+    replace_once(
+        path,
+        "export interface NotificationPreferencesDto {\n"
+        "  enabled: boolean;\n"
+        "  playSound: boolean;\n",
+        "export type NotificationSound =\n"
+        "  | \"default\"\n"
+        "  | \"im\"\n"
+        "  | \"mail\"\n"
+        "  | \"reminder\"\n"
+        "  | \"sms\";\n\n"
+        "export interface NotificationPreferencesDto {\n"
+        "  enabled: boolean;\n"
+        "  playSound: boolean;\n"
+        "  resetSound: NotificationSound;\n",
+        "notification sound TypeScript contract",
+    )
+
+    path = source / "apps/desktop-tauri/src/lib/tauri.ts"
+    replace_once(
+        path,
+        '  sendTestNotification: "send_test_notification",\n',
+        '  sendTestNotification: "send_test_notification",\n'
+        '  previewNotificationSound: "preview_notification_sound",\n',
+        "notification sound preview command name",
+    )
+    replace_once(
+        path,
+        '  FloatBallMotionDto,\n} from "../types/bridge";',
+        '  FloatBallMotionDto,\n  NotificationSound,\n} from "../types/bridge";',
+        "notification sound bridge type import",
+    )
+    replace_once(
+        path,
+        "export const sendTestNotification = () =>\n"
+        "  invoke<void>(commands.sendTestNotification);\n",
+        "export const sendTestNotification = () =>\n"
+        "  invoke<void>(commands.sendTestNotification);\n\n"
+        "export const previewNotificationSound = (sound: NotificationSound) =>\n"
+        "  invoke<void>(commands.previewNotificationSound, { sound });\n",
+        "notification sound preview bridge export",
+    )
+    path = source / "apps/desktop-tauri/src/types/bridge.test.ts"
+    replace_once(
+        path,
+        '      sendTestNotification: "send_test_notification",\n',
+        '      sendTestNotification: "send_test_notification",\n'
+        '      previewNotificationSound: "preview_notification_sound",\n',
+        "notification sound preview command contract",
+    )
+
+
+def patch_reset_notification_sound_controller(source: Path) -> None:
+    path = source / "apps/desktop-tauri/src-tauri/src/notification_controller.rs"
+    replace_once(
+        path,
+        "    storage::{AppSettings, LanguagePreference, SettingsRepository},",
+        "    storage::{AppSettings, LanguagePreference, NotificationSound, SettingsRepository},",
+        "notification sound controller import",
+    )
+    replace_once(
+        path,
+        "pub trait ToastSink: Send {\n"
+        "    fn send(&mut self, title: &str, body: &str, play_sound: bool) -> Result<(), String>;\n"
+        "}",
+        "pub trait ToastSink: Send {\n"
+        "    fn send(&mut self, title: &str, body: &str, play_sound: bool) -> Result<(), String>;\n\n"
+        "    fn send_with_sound(\n"
+        "        &mut self,\n"
+        "        title: &str,\n"
+        "        body: &str,\n"
+        "        play_sound: bool,\n"
+        "        _sound: NotificationSound,\n"
+        "    ) -> Result<(), String> {\n"
+        "        self.send(title, body, play_sound)\n"
+        "    }\n"
+        "}",
+        "toast sink selected sound support",
+    )
+    replace_once(
+        path,
+        "impl ToastSink for WindowsToastSink {\n"
+        "    fn send(&mut self, title: &str, body: &str, play_sound: bool) -> Result<(), String> {\n"
+        "        send_windows_toast(title, body, play_sound)\n"
+        "    }\n"
+        "}",
+        "impl ToastSink for WindowsToastSink {\n"
+        "    fn send(&mut self, title: &str, body: &str, play_sound: bool) -> Result<(), String> {\n"
+        "        send_windows_toast(title, body, play_sound, None)\n"
+        "    }\n\n"
+        "    fn send_with_sound(\n"
+        "        &mut self,\n"
+        "        title: &str,\n"
+        "        body: &str,\n"
+        "        play_sound: bool,\n"
+        "        sound: NotificationSound,\n"
+        "    ) -> Result<(), String> {\n"
+        "        send_windows_toast(title, body, play_sound, Some(sound))\n"
+        "    }\n"
+        "}",
+        "Windows toast selected sound support",
+    )
+    replace_once(
+        path,
+        "    pub fn send_task_completion(\n",
+        "    pub fn preview_sound(\n"
+        "        &mut self,\n"
+        "        repository: &SettingsRepository,\n"
+        "        sound: NotificationSound,\n"
+        "    ) -> Result<(), String> {\n"
+        "        let settings = load_settings(repository)?;\n"
+        "        let (title, body) = sound_preview_copy(&settings);\n"
+        "        self.sink\n"
+        "            .send_with_sound(title, body, true, sound)\n"
+        "            .map_err(|error| map_sink_error(error, \"NOTIFICATION_SOUND_PREVIEW_FAILED\"))\n"
+        "    }\n\n"
+        "    pub fn send_task_completion(\n",
+        "notification sound preview controller",
+    )
+    replace_once(
+        path,
+        "        for event in events {\n"
+        "            let (title, body) = event_copy(settings, &event);\n"
+        "            self.sink\n"
+        "                .send(&title, &body, settings.notifications.play_sound)\n"
+        "                .map_err(|error| map_sink_error(error, \"NOTIFICATION_DISPATCH_FAILED\"))?;\n"
+        "        }",
+        "        for event in events {\n"
+        "            let (title, body) = event_copy(settings, &event);\n"
+        "            let result = if matches!(\n"
+        "                event,\n"
+        "                V1NotificationEvent::FiveHourReset | V1NotificationEvent::WeeklyReset\n"
+        "            ) {\n"
+        "                self.sink.send_with_sound(\n"
+        "                    &title,\n"
+        "                    &body,\n"
+        "                    settings.notifications.play_sound,\n"
+        "                    settings.notifications.reset_sound,\n"
+        "                )\n"
+        "            } else {\n"
+        "                self.sink\n"
+        "                    .send(&title, &body, settings.notifications.play_sound)\n"
+        "            };\n"
+        "            result.map_err(|error| map_sink_error(error, \"NOTIFICATION_DISPATCH_FAILED\"))?;\n"
+        "        }",
+        "reset notifications use selected sound",
+    )
+    replace_once(
+        path,
+        "fn test_copy(settings: &AppSettings) -> (&'static str, &'static str) {",
+        "fn sound_preview_copy(settings: &AppSettings) -> (&'static str, &'static str) {\n"
+        "    if use_chinese(settings) {\n"
+        "        (\n"
+        "            \"重置通知提示音试听\",\n"
+        "            \"这是 5 小时或每周额度重置通知的提示音。\",\n"
+        "        )\n"
+        "    } else {\n"
+        "        (\n"
+        "            \"Reset notification sound preview\",\n"
+        "            \"This is the sound for 5-hour or weekly allowance resets.\",\n"
+        "        )\n"
+        "    }\n"
+        "}\n\n"
+        "fn test_copy(settings: &AppSettings) -> (&'static str, &'static str) {",
+        "notification sound preview copy",
+    )
+    replace_once(
+        path,
+        "fn send_windows_toast(title: &str, body: &str, play_sound: bool) -> Result<(), String> {\n"
+        "    send_windows_toast_with(&SystemNotificationSettingProbe, true, || {\n"
+        "        run_windows_toast_transport(title, body, play_sound)\n"
+        "    })\n"
+        "}\n\n"
+        "fn windows_toast_script(title: &str, body: &str, play_sound: bool) -> String {\n"
+        "    let audio = if play_sound {\n"
+        "        \"\"\n"
+        "    } else {\n"
+        "        r#\"<audio silent=\"true\"/>\"#\n"
+        "    };",
+        "fn send_windows_toast(\n"
+        "    title: &str,\n"
+        "    body: &str,\n"
+        "    play_sound: bool,\n"
+        "    sound: Option<NotificationSound>,\n"
+        ") -> Result<(), String> {\n"
+        "    send_windows_toast_with(&SystemNotificationSettingProbe, true, || {\n"
+        "        run_windows_toast_transport(title, body, play_sound, sound)\n"
+        "    })\n"
+        "}\n\n"
+        "fn windows_toast_script(\n"
+        "    title: &str,\n"
+        "    body: &str,\n"
+        "    play_sound: bool,\n"
+        "    sound: Option<NotificationSound>,\n"
+        ") -> String {\n"
+        "    let audio = if !play_sound {\n"
+        "        r#\"<audio silent=\"true\"/>\"#.to_string()\n"
+        "    } else if let Some(sound) = sound {\n"
+        "        format!(r#\"<audio src=\"{}\"/>\"#, sound.toast_uri())\n"
+        "    } else {\n"
+        "        String::new()\n"
+        "    };",
+        "Windows toast audio payload",
+    )
+    replace_once(
+        path,
+        "fn run_windows_toast_transport(title: &str, body: &str, play_sound: bool) -> Result<(), String> {",
+        "fn run_windows_toast_transport(\n"
+        "    title: &str,\n"
+        "    body: &str,\n"
+        "    play_sound: bool,\n"
+        "    sound: Option<NotificationSound>,\n"
+        ") -> Result<(), String> {",
+        "Windows toast transport sound argument",
+    )
+    replace_once(
+        path,
+        "    let script = windows_toast_script(title, body, play_sound);",
+        "    let script = windows_toast_script(title, body, play_sound, sound);",
+        "Windows toast script sound argument",
+    )
+    replace_once(
+        path,
+        "fn send_windows_toast(_title: &str, _body: &str, _play_sound: bool) -> Result<(), String> {",
+        "fn send_windows_toast(\n"
+        "    _title: &str,\n"
+        "    _body: &str,\n"
+        "    _play_sound: bool,\n"
+        "    _sound: Option<NotificationSound>,\n"
+        ") -> Result<(), String> {",
+        "non-Windows toast sound argument",
+    )
+    replace_once(
+        path,
+        '        let script = windows_toast_script("Title", "Body", false);',
+        '        let script = windows_toast_script("Title", "Body", false, None);',
+        "silent toast test sound argument",
+    )
+    append_once(
+        path,
+        "fn selected_reset_sound_is_written_to_toast_xml()",
+        r'''#[cfg(test)]
+mod plus_sound_tests {
+    use codexbar::storage::NotificationSound;
+
+    use super::windows_toast_script;
+
+    #[test]
+    fn selected_reset_sound_is_written_to_toast_xml() {
+        let script = windows_toast_script("Title", "Body", true, Some(NotificationSound::Reminder));
+        assert!(script.contains(r#"<audio src="ms-winsoundevent:Notification.Reminder"/>"#));
+    }
+
+    #[test]
+    fn sound_preview_can_force_audio_while_automatic_sound_is_configurable() {
+        let audible = windows_toast_script("Title", "Body", true, Some(NotificationSound::Mail));
+        let silent = windows_toast_script("Title", "Body", false, Some(NotificationSound::Mail));
+        assert!(audible.contains("Notification.Mail"));
+        assert!(silent.contains(r#"<audio silent="true"/>"#));
+        assert!(!silent.contains("Notification.Mail"));
+    }
+}''',
+    )
+
+    path = source / "apps/desktop-tauri/src-tauri/src/commands/settings.rs"
+    replace_once(
+        path,
+        "use codexbar::storage::SettingsPatch;",
+        "use codexbar::storage::{NotificationSound, SettingsPatch};",
+        "notification sound settings command import",
+    )
+    replace_once(
+        path,
+        "fn send_test_notification_with<F>(\n",
+        "#[tauri::command]\n"
+        "pub fn preview_notification_sound(\n"
+        "    app: tauri::AppHandle,\n"
+        "    sound: String,\n"
+        "    state: tauri::State<'_, Mutex<AppState>>,\n"
+        "    controller: tauri::State<'_, Mutex<NotificationController<WindowsToastSink>>>,\n"
+        ") -> Result<(), String> {\n"
+        "    let sound = NotificationSound::from_id(&sound)\n"
+        "        .map_err(|_| \"NOTIFICATION_SOUND_PREVIEW_FAILED\".to_string())?;\n"
+        "    let capability = notification_capability();\n"
+        "    let proof_mode = crate::proof_harness::is_proof_mode(&app);\n"
+        "    send_test_notification_with(proof_mode, capability, || {\n"
+        "        let repository = settings_repository(&state)?;\n"
+        "        controller\n"
+        "            .lock()\n"
+        "            .map_err(|_| \"NOTIFICATION_SOUND_PREVIEW_FAILED\".to_string())?\n"
+        "            .preview_sound(&repository, sound)\n"
+        "            .map_err(map_notification_sound_preview_error)\n"
+        "    })\n"
+        "    .map_err(map_notification_sound_preview_error)\n"
+        "}\n\n"
+        "fn map_notification_sound_preview_error(error: String) -> String {\n"
+        "    if error == \"NOTIFICATION_PERMISSION_DISABLED\" {\n"
+        "        error\n"
+        "    } else {\n"
+        "        \"NOTIFICATION_SOUND_PREVIEW_FAILED\".to_string()\n"
+        "    }\n"
+        "}\n\n"
+        "fn send_test_notification_with<F>(\n",
+        "notification sound preview command",
+    )
+    path = source / "apps/desktop-tauri/src-tauri/src/main.rs"
+    replace_once(
+        path,
+        "            commands::send_test_notification,\n",
+        "            commands::send_test_notification,\n"
+        "            commands::preview_notification_sound,\n",
+        "notification sound preview command registration",
+    )
+
+
+def patch_reset_notification_sound_ui(source: Path) -> None:
+    path = source / "apps/desktop-tauri/src/surfaces/settings/tabs/NotificationsTab.tsx"
+    replace_once(
+        path,
+        "  openWindowsNotificationSettings,\n  sendTestNotification,\n",
+        "  openWindowsNotificationSettings,\n  previewNotificationSound,\n  sendTestNotification,\n",
+        "notification sound preview UI import",
+    )
+    replace_once(
+        path,
+        "  NotificationCapabilityDto,\n  SettingsPatchDto,",
+        "  NotificationCapabilityDto,\n  NotificationSound,\n  SettingsPatchDto,",
+        "notification sound UI type import",
+    )
+    replace_once(
+        path,
+        "type NotificationBooleanField =",
+        "const RESET_SOUNDS: readonly NotificationSound[] = [\n"
+        "  \"default\",\n"
+        "  \"im\",\n"
+        "  \"mail\",\n"
+        "  \"reminder\",\n"
+        "  \"sms\",\n"
+        "];\n\n"
+        "type NotificationBooleanField =",
+        "notification sound UI options",
+    )
+    replace_once(
+        path,
+        "  sendTest = sendTestNotification,\n  getCapability = getNotificationCapability,",
+        "  sendTest = sendTestNotification,\n"
+        "  previewSound = previewNotificationSound,\n"
+        "  getCapability = getNotificationCapability,",
+        "notification sound preview UI dependency",
+    )
+    replace_once(
+        path,
+        "  sendTest?: () => Promise<void>;\n  getCapability?: () => Promise<NotificationCapabilityDto>;",
+        "  sendTest?: () => Promise<void>;\n"
+        "  previewSound?: (sound: NotificationSound) => Promise<void>;\n"
+        "  getCapability?: () => Promise<NotificationCapabilityDto>;",
+        "notification sound preview UI prop",
+    )
+    replace_once(
+        path,
+        "  const [testing, setTesting] = useState(false);\n"
+        "  const [openingSettings, setOpeningSettings] = useState(false);",
+        "  const [testing, setTesting] = useState(false);\n"
+        "  const [previewingSound, setPreviewingSound] = useState(false);\n"
+        "  const [openingSettings, setOpeningSettings] = useState(false);",
+        "notification sound preview UI state",
+    )
+    replace_once(
+        path,
+        "  const openNotificationRecovery = () => {",
+        "  const runSoundPreview = (sound: NotificationSound, save: boolean) => {\n"
+        "    setError(null);\n"
+        "    setTestSent(false);\n"
+        "    if (capabilityLoading || capability?.status !== \"available\") {\n"
+        "      return;\n"
+        "    }\n"
+        "    setPreviewingSound(true);\n"
+        "    const saveSound = save\n"
+        "      ? update({ notifications: { resetSound: sound } })\n"
+        "      : Promise.resolve();\n"
+        "    void saveSound\n"
+        "      .then(() => previewSound(sound))\n"
+        "      .catch((reason: unknown) => {\n"
+        "        if (reason === \"NOTIFICATION_PERMISSION_DISABLED\") {\n"
+        "          refreshCapability();\n"
+        "          return;\n"
+        "        }\n"
+        "        setError(\n"
+        "          save ? copy.notifications.saveFailed : copy.notifications.soundPreviewFailed,\n"
+        "        );\n"
+        "      })\n"
+        "      .finally(() => setPreviewingSound(false));\n"
+        "  };\n\n"
+        "  const openNotificationRecovery = () => {",
+        "notification sound preview UI action",
+    )
+    replace_once(
+        path,
+        "        <NotificationSwitch\n"
+        "          label={copy.notifications.weeklyReset}\n"
+        "          checked={notifications.weeklyResetEnabled}\n"
+        "          disabled={!notifications.enabled}\n"
+        "          onChange={(value) => saveBoolean(\"weeklyResetEnabled\", value)}\n"
+        "        />\n"
+        "        <div className=\"settings-field\">",
+        "        <NotificationSwitch\n"
+        "          label={copy.notifications.weeklyReset}\n"
+        "          checked={notifications.weeklyResetEnabled}\n"
+        "          disabled={!notifications.enabled}\n"
+        "          onChange={(value) => saveBoolean(\"weeklyResetEnabled\", value)}\n"
+        "        />\n"
+        "        <p className=\"settings-field\">\n"
+        "          <label htmlFor=\"notification-reset-sound\">\n"
+        "            {copy.notifications.resetSound}\n"
+        "          </label>\n"
+        "          <select\n"
+        "            id=\"notification-reset-sound\"\n"
+        "            value={notifications.resetSound}\n"
+        "            disabled={\n"
+        "              capabilityLoading ||\n"
+        "              capability?.status !== \"available\" ||\n"
+        "              previewingSound\n"
+        "            }\n"
+        "            onChange={(event) =>\n"
+        "              runSoundPreview(event.target.value as NotificationSound, true)\n"
+        "            }\n"
+        "          >\n"
+        "            {RESET_SOUNDS.map((sound) => (\n"
+        "              <option key={sound} value={sound}>\n"
+        "                {copy.notifications.soundOptions[sound]}\n"
+        "              </option>\n"
+        "            ))}\n"
+        "          </select>\n"
+        "          <button\n"
+        "            type=\"button\"\n"
+        "            disabled={\n"
+        "              capabilityLoading ||\n"
+        "              capability?.status !== \"available\" ||\n"
+        "              previewingSound\n"
+        "            }\n"
+        "            onClick={() => runSoundPreview(notifications.resetSound, false)}\n"
+        "          >\n"
+        "            {previewingSound\n"
+        "              ? copy.notifications.previewingSound\n"
+        "              : copy.notifications.previewSound}\n"
+        "          </button>\n"
+        "          <small>{copy.notifications.resetSoundDescription}</small>\n"
+        "        </p>\n"
+        "        <div className=\"settings-field\">",
+        "notification sound selector and preview",
+    )
+
+    path = source / "apps/desktop-tauri/src/surfaces/settings/settingsCopy.ts"
+    replace_once(
+        path,
+        "    playSound: string;\n    sendTest: string;",
+        "    playSound: string;\n"
+        "    resetSound: string;\n"
+        "    resetSoundDescription: string;\n"
+        "    soundOptions: Record<\"default\" | \"im\" | \"mail\" | \"reminder\" | \"sms\", string>;\n"
+        "    previewSound: string;\n"
+        "    previewingSound: string;\n"
+        "    soundPreviewFailed: string;\n"
+        "    sendTest: string;",
+        "notification sound copy contract",
+    )
+    replace_once(
+        path,
+        '    playSound: "Play a sound with notifications",\n'
+        '    sendTest: "Send test notification",',
+        '    playSound: "Play a sound with notifications",\n'
+        '    resetSound: "Reset notification sound",\n'
+        '    resetSoundDescription: "Selecting a sound previews it immediately. Previewing sends one local Windows notification.",\n'
+        '    soundOptions: { default: "Default", im: "Instant message", mail: "Mail", reminder: "Reminder", sms: "SMS" },\n'
+        '    previewSound: "Preview sound",\n'
+        '    previewingSound: "Previewing…",\n'
+        '    soundPreviewFailed: "Windows could not preview this sound. Check notification settings and try again.",\n'
+        '    sendTest: "Send test notification",',
+        "English notification sound copy",
+    )
+    replace_once(
+        path,
+        '    playSound: "通知时播放声音",\n'
+        '    sendTest: "发送测试通知",',
+        '    playSound: "通知时播放声音",\n'
+        '    resetSound: "重置通知提示音",\n'
+        '    resetSoundDescription: "选择后会立即试听；试听会发送一条本地 Windows 预览通知。",\n'
+        '    soundOptions: { default: "默认", im: "即时消息", mail: "邮件", reminder: "提醒", sms: "短信" },\n'
+        '    previewSound: "试听",\n'
+        '    previewingSound: "正在试听…",\n'
+        '    soundPreviewFailed: "Windows 无法试听该提示音，请检查通知设置后重试。",\n'
+        '    sendTest: "发送测试通知",',
+        "Chinese notification sound copy",
+    )
+
+    path = source / "apps/desktop-tauri/src/surfaces/settings/tabs/NotificationsTab.test.tsx"
+    replace_once(
+        path,
+        "    playSound: true,\n    warningEnabled: true,",
+        "    playSound: true,\n    resetSound: \"default\",\n    warningEnabled: true,",
+        "notification sound UI test fixture",
+    )
+    append_once(
+        path,
+        'it("saves and previews the selected reset notification sound")',
+        r'''describe("Plus reset notification sounds", () => {
+  it("saves and previews the selected reset notification sound", async () => {
+    const update = vi.fn().mockResolvedValue(settings);
+    const previewSound = vi.fn().mockResolvedValue(undefined);
+    render(
+      <NotificationsTab
+        settings={{
+          ...settings,
+          notifications: { ...settings.notifications, enabled: true },
+        }}
+        update={update}
+        copy={settingsCopy("en-US")}
+        previewSound={previewSound}
+        getCapability={vi.fn().mockResolvedValue({
+          status: "available",
+          canOpenSettings: true,
+        })}
+      />,
+    );
+
+    const sound = await screen.findByRole("combobox", {
+      name: "Reset notification sound",
+    });
+    await waitFor(() => expect(sound).toBeEnabled());
+    fireEvent.change(sound, { target: { value: "reminder" } });
+
+    await waitFor(() => {
+      expect(update).toHaveBeenCalledWith({
+        notifications: { resetSound: "reminder" },
+      });
+      expect(previewSound).toHaveBeenCalledWith("reminder");
+    });
+  });
+
+  it("previews the saved reset sound again without rewriting settings", async () => {
+    const update = vi.fn().mockResolvedValue(settings);
+    const previewSound = vi.fn().mockResolvedValue(undefined);
+    render(
+      <NotificationsTab
+        settings={{
+          ...settings,
+          notifications: {
+            ...settings.notifications,
+            enabled: true,
+            resetSound: "mail",
+          },
+        }}
+        update={update}
+        copy={settingsCopy("en-US")}
+        previewSound={previewSound}
+        getCapability={vi.fn().mockResolvedValue({
+          status: "available",
+          canOpenSettings: true,
+        })}
+      />,
+    );
+
+    const preview = await screen.findByRole("button", { name: "Preview sound" });
+    await waitFor(() => expect(preview).toBeEnabled());
+    fireEvent.click(preview);
+
+    await waitFor(() => expect(previewSound).toHaveBeenCalledWith("mail"));
+    expect(update).not.toHaveBeenCalled();
+  });
+
+  it("allows an explicit preview while automatic notifications are off", async () => {
+    const previewSound = vi.fn().mockResolvedValue(undefined);
+    render(
+      <NotificationsTab
+        settings={{
+          ...settings,
+          notifications: {
+            ...settings.notifications,
+            enabled: false,
+            weeklyResetEnabled: false,
+            resetSound: "sms",
+          },
+        }}
+        update={vi.fn().mockResolvedValue(settings)}
+        copy={settingsCopy("en-US")}
+        previewSound={previewSound}
+        getCapability={vi.fn().mockResolvedValue({
+          status: "available",
+          canOpenSettings: true,
+        })}
+      />,
+    );
+
+    const preview = await screen.findByRole("button", { name: "Preview sound" });
+    await waitFor(() => expect(preview).toBeEnabled());
+    fireEvent.click(preview);
+
+    await waitFor(() => expect(previewSound).toHaveBeenCalledWith("sms"));
+  });
+});''',
+    )
+
+    fixture_replacements = [
+        (
+            "apps/desktop-tauri/src/hooks/useSettings.ts",
+            "    playSound: true,\n    warningEnabled: true,",
+            "    playSound: true,\n    resetSound: \"default\",\n    warningEnabled: true,",
+        ),
+        (
+            "apps/desktop-tauri/src/hooks/useStatusSurface.ts",
+            "      playSound: true,\n      warningEnabled: true,",
+            "      playSound: true,\n      resetSound: \"default\",\n      warningEnabled: true,",
+        ),
+        (
+            "apps/desktop-tauri/src/test/profileUsageFixtures.ts",
+            "    playSound: true,\n    warningEnabled: true,",
+            "    playSound: true,\n    resetSound: \"default\",\n    warningEnabled: true,",
+        ),
+        (
+            "apps/desktop-tauri/src/hooks/useSettings.test.tsx",
+            "      playSound: true,\n      warningEnabled: true,",
+            "      playSound: true,\n      resetSound: \"default\",\n      warningEnabled: true,",
+        ),
+    ]
+    for relative, old, new in fixture_replacements:
+        replace_once(
+            source / relative,
+            old,
+            new,
+            f"notification sound default fixture ({relative})",
+        )
+
+    path = source / "apps/desktop-tauri/src/types/bridge.test.ts"
+    replace_once(
+        path,
+        "        enabled: false,\n"
+        "        playSound: true,\n"
+        "        warningEnabled: true,",
+        "        enabled: false,\n"
+        "        playSound: true,\n"
+        "        resetSound: \"default\",\n"
+        "        warningEnabled: true,",
+        "notification sound bridge input fixture",
+    )
+    replace_once(
+        path,
+        "      enabled: false,\n"
+        "      playSound: true,\n"
+        "      warningEnabled: true,",
+        "      enabled: false,\n"
+        "      playSound: true,\n"
+        "      resetSound: \"default\",\n"
+        "      warningEnabled: true,",
+        "notification sound bridge expectation",
+    )
 
 
 def patch_freshness_setting(source: Path) -> None:
@@ -951,12 +1827,54 @@ def patch_version_branding(source: Path, version: str) -> None:
     text = text.replace('"version": "1.0.30"', f'"version": "{version}"', 1)
     tauri.write_text(text, encoding="utf-8")
 
+    for package_name in ("codexbar", "codex-barbar-desktop"):
+        replace_once(
+            source / "Cargo.lock",
+            f'name = "{package_name}"\nversion = "1.0.30"',
+            f'name = "{package_name}"\nversion = "{version}"',
+            f"{package_name} lockfile package version",
+        )
+
+    # The Plus version has its own numbering (0.2.0). Upstream's hard-coded
+    # 1.0.0 fixture is newer than this release, so use an actually older tag.
+    replace_once(
+        source / "rust/src/update_check.rs",
+        'r#"{"tag_name":"v1.0.0","html_url":"https://github.com/naipi11/codex-barbar/releases/tag/v1.0.0"}"#',
+        'r#"{"tag_name":"v0.0.0","html_url":"https://github.com/naipi11/codex-barbar/releases/tag/v0.0.0"}"#',
+        "older release fixture for Plus version numbering",
+    )
+
+
+def patch_portable_docs(source: Path) -> None:
+    path = source / "PORTABLE.md"
+    replace_once(
+        path,
+        "```text\n"
+        "codex-barbar.exe\n"
+        "LICENSE\n",
+        "```text\n"
+        "codex-barbar.exe\n"
+        "WebView2Loader.dll\n"
+        "LICENSE\n",
+        "portable WebView2 loader file list",
+    )
+    replace_once(
+        path,
+        "No installer or registry change is made. The executable is the same\n"
+        "Windows x64 desktop binary that the NSIS installer deploys.\n",
+        "No installer or registry change is made. `WebView2Loader.dll` is the x64\n"
+        "runtime loader produced beside the executable and must remain in the same\n"
+        "directory. The executable is the same Windows x64 desktop binary that the\n"
+        "NSIS installer deploys.\n",
+        "portable WebView2 loader guidance",
+    )
+
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", required=True, type=Path)
     parser.add_argument("--overlay", required=True, type=Path)
-    parser.add_argument("--version", default="1.0.30-plus.5")
+    parser.add_argument("--version", default="0.2.0")
     args = parser.parse_args()
 
     source = args.source.resolve()
@@ -975,11 +1893,20 @@ def main() -> None:
     patch_main(source)
     patch_notification_controller(source)
     patch_notification_labels(source)
+    patch_reset_notification_sound_storage(source)
+    patch_reset_notification_sound_bridge(source)
+    patch_reset_notification_sound_controller(source)
+    patch_reset_notification_sound_ui(source)
     patch_freshness_setting(source)
     patch_taskbar_five_hour_setting(source)
     patch_taskbar_css(source)
     patch_task_css(source)
+    patch_audit_usage(source)
+    patch_audit_ui(source)
+    patch_audit_settings(source)
+    patch_memory_fixes(source)
     patch_version_branding(source, args.version)
+    patch_portable_docs(source)
     print(f"codex-barbar-plus overlay applied ({args.version})")
 
 

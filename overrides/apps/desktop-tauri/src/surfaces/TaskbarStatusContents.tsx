@@ -81,7 +81,7 @@ export function TaskbarStatusContents({
             />
           </span>
         ) : null}
-        {!presentation.plusMode && showAccount && compactIdentity ? (
+        {showAccount && compactIdentity ? (
           <span className="taskbar-status__identity">{compactIdentity}</span>
         ) : null}
         {fiveHourText ? (

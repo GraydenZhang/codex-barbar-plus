@@ -1,14 +1,14 @@
 use std::{
     collections::{HashMap, HashSet},
     fs::{self, File},
-    io::{BufRead, BufReader, Seek, SeekFrom},
+    io::{self, BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::Mutex,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use chrono::{DateTime, TimeZone, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::{AppHandle, Emitter, Manager};
 use uuid::Uuid;
@@ -18,6 +18,7 @@ use crate::state::AppState;
 const EVENT_NAME: &str = "desktop-task-state-changed";
 const MAX_VISIBLE_TASKS: usize = 8;
 const MAX_BOOTSTRAP_BYTES: u64 = 768 * 1024;
+const RECOVERY_BLOCK_BYTES: u64 = 64 * 1024;
 const TAIL_RECONCILE_BYTES: u64 = 160 * 1024;
 const DISCOVERY_INTERVAL_TICKS: u64 = 4;
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -207,17 +208,14 @@ fn read_session_index_titles(path: &Path) -> HashMap<String, String> {
 }
 
 fn bootstrap_file(runtime: &mut RuntimeState, path: &Path) {
-    let Some((thread_id, is_subagent)) = read_session_metadata(path) else {
-        runtime.ignored_files.insert(path.to_path_buf());
-        return;
+    let thread_id = match read_session_metadata(path) {
+        SessionMetadata::Ready(thread_id) => thread_id,
+        SessionMetadata::Pending => return,
+        SessionMetadata::Ignored => {
+            runtime.ignored_files.insert(path.to_path_buf());
+            return;
+        }
     };
-    if is_subagent {
-        runtime.ignored_files.insert(path.to_path_buf());
-        return;
-    }
-    runtime
-        .thread_id_by_file
-        .insert(path.to_path_buf(), thread_id);
     let Ok(mut file) = File::open(path) else {
         return;
     };
@@ -226,63 +224,206 @@ fn bootstrap_file(runtime: &mut RuntimeState, path: &Path) {
     };
     let len = metadata.len();
     let start = len.saturating_sub(MAX_BOOTSTRAP_BYTES);
-    if start > 0 && file.seek(SeekFrom::Start(start)).is_ok() {
-        let mut discard = String::new();
-        let mut reader = BufReader::new(file);
-        let _ = reader.read_line(&mut discard);
-        for line in reader.lines().map_while(Result::ok) {
-            process_line(runtime, path, &line, false, None);
-        }
-    } else {
-        let reader = BufReader::new(file);
-        for line in reader.lines().map_while(Result::ok) {
-            process_line(runtime, path, &line, false, None);
-        }
+    let mut tail = vec![0; (len - start) as usize];
+    if file.seek(SeekFrom::Start(start)).is_err() || file.read_exact(&mut tail).is_err() {
+        return;
     }
-    runtime.file_offsets.insert(path.to_path_buf(), len);
+    let last_newline = tail.iter().rposition(|byte| *byte == b'\n');
+    let first_complete = if start == 0 {
+        0
+    } else {
+        tail.iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(tail.len(), |position| position + 1)
+    };
+    let tail_end = last_newline.map_or(0, |position| position + 1);
+    let lines = &tail[first_complete.min(tail_end)..tail_end];
+    let has_lifecycle = lines
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| std::str::from_utf8(line).ok())
+        .any(|line| lifecycle_event(line).is_some());
+    // A long turn can have megabytes of output after its start. Only on
+    // bootstrap, and only without lifecycle evidence in the bounded tail,
+    // search further back. The first lifecycle found is authoritative: a
+    // completion/error must never resurrect an older start.
+    let recovery = if has_lifecycle {
+        None
+    } else {
+        let Ok(recovery) = recover_latest_lifecycle(&mut file, len) else {
+            return;
+        };
+        Some(recovery)
+    };
+    runtime
+        .thread_id_by_file
+        .insert(path.to_path_buf(), thread_id.clone());
+    for line in lines
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| std::str::from_utf8(line).ok())
+    {
+        process_line(runtime, path, line, false, None);
+    }
+    if let Some((Some(event), _)) = &recovery
+        && event.status == TaskStatus::Working
+    {
+        start_task(runtime, &thread_id, &event.turn_id, event.started_at);
+    }
+    let committed_end = recovery.map_or_else(
+        || start + tail_end as u64,
+        |(_, committed_end)| committed_end,
+    );
+    runtime.file_offsets.insert(path.to_path_buf(), committed_end);
+    prune_tasks(runtime);
 }
 
 fn process_known_files(app: &AppHandle, runtime: &mut RuntimeState) {
     let paths: Vec<PathBuf> = runtime.known_files.iter().cloned().collect();
     for path in paths {
-        if runtime.ignored_files.contains(&path) {
-            continue;
-        }
-        let offset = runtime.file_offsets.get(&path).copied().unwrap_or(0);
-        let Ok(mut file) = File::open(&path) else {
-            continue;
+        process_file_updates(runtime, &path, Some(app));
+    }
+}
+
+fn process_file_updates(runtime: &mut RuntimeState, path: &Path, app: Option<&AppHandle>) {
+    if runtime.ignored_files.contains(path) {
+        return;
+    }
+    // A newly discovered file may still be empty, half-written or locked.
+    // Retry its metadata before accepting any events (including subagent events).
+    let Some(&offset) = runtime.file_offsets.get(path) else {
+        bootstrap_file(runtime, path);
+        return;
+    };
+    let Ok(mut file) = File::open(path) else {
+        return;
+    };
+    let Ok(metadata) = file.metadata() else {
+        return;
+    };
+    let len = metadata.len();
+    if len < offset {
+        runtime.file_offsets.remove(path);
+        bootstrap_file(runtime, path);
+        return;
+    }
+    if file.seek(SeekFrom::Start(offset)).is_err() {
+        return;
+    }
+    let mut reader = BufReader::new(file.take(len - offset));
+    let mut line = String::new();
+    let mut position = offset;
+    loop {
+        line.clear();
+        let Ok(read) = reader.read_line(&mut line) else {
+            break;
         };
-        let Ok(metadata) = file.metadata() else {
-            continue;
+        if read == 0 || !line.ends_with('\n') {
+            // Keep the offset before an unfinished JSONL record so the next
+            // poll can consume the complete event after the writer appends it.
+            break;
+        }
+        position = position.saturating_add(read as u64);
+        process_line(runtime, path, line.trim_end(), true, app);
+    }
+    runtime.file_offsets.insert(path.to_path_buf(), position);
+}
+
+#[derive(Deserialize)]
+struct LifecycleProjection {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    timestamp: Option<Value>,
+    payload: Option<LifecyclePayload>,
+}
+
+#[derive(Deserialize)]
+struct LifecyclePayload {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    turn_id: Option<String>,
+    started_at: Option<Value>,
+}
+
+struct RecoveredLifecycle {
+    turn_id: String,
+    status: TaskStatus,
+    started_at: DateTime<Utc>,
+}
+
+impl LifecycleProjection {
+    fn into_lifecycle(self) -> Option<RecoveredLifecycle> {
+        if self.kind.as_deref() != Some("event_msg") {
+            return None;
+        }
+        let payload = self.payload?;
+        let status = match payload.kind.as_deref()? {
+            "task_started" => TaskStatus::Working,
+            "task_complete" | "turn_completed" => TaskStatus::Completed,
+            "turn_aborted" | "turn_failed" | "task_failed" => TaskStatus::Error,
+            _ => return None,
         };
-        let len = metadata.len();
-        if len < offset {
-            runtime.file_offsets.insert(path.clone(), 0);
-        }
-        let start = runtime
-            .file_offsets
-            .get(&path)
-            .copied()
-            .unwrap_or(0)
-            .min(len);
-        if file.seek(SeekFrom::Start(start)).is_err() {
-            continue;
-        }
-        let mut reader = BufReader::new(file);
-        let mut line = String::new();
-        let mut position = start;
-        loop {
-            line.clear();
-            let Ok(read) = reader.read_line(&mut line) else {
-                break;
-            };
-            if read == 0 {
-                break;
+        let started_at = payload
+            .started_at
+            .and_then(|value| value.as_i64())
+            .and_then(|seconds| Utc.timestamp_opt(seconds, 0).single())
+            .or_else(|| parse_timestamp(self.timestamp.as_ref()))
+            .unwrap_or_else(Utc::now);
+        Some(RecoveredLifecycle {
+            turn_id: payload.turn_id?,
+            status,
+            started_at,
+        })
+    }
+}
+
+/// Find the latest complete lifecycle record with fixed-size reverse reads.
+/// Lines spanning blocks are parsed through a streaming field projection, so
+/// large tool output or completion messages do not accumulate in a buffer.
+/// Return the last complete-line offset as well, leaving any partial EOF unread.
+fn recover_latest_lifecycle(
+    file: &mut File,
+    len: u64,
+) -> io::Result<(Option<RecoveredLifecycle>, u64)> {
+    let mut block = vec![0; RECOVERY_BLOCK_BYTES as usize];
+    let mut block_end = len;
+    let mut line_end = None;
+    let mut committed_end = 0;
+    while block_end > 0 {
+        let block_start = block_end.saturating_sub(RECOVERY_BLOCK_BYTES);
+        let bytes = &mut block[..(block_end - block_start) as usize];
+        file.seek(SeekFrom::Start(block_start))?;
+        file.read_exact(bytes)?;
+        for index in (0..bytes.len()).rev().filter(|index| bytes[*index] == b'\n') {
+            let next_line_start = block_start + index as u64 + 1;
+            if let Some(end) = line_end {
+                let event: Option<LifecycleProjection> = if end <= block_end {
+                    serde_json::from_slice(&bytes[index + 1..(end - block_start) as usize]).ok()
+                } else {
+                    file.seek(SeekFrom::Start(next_line_start))?;
+                    read_lifecycle_projection((&mut *file).take(end - next_line_start))?
+                };
+                if let Some(event) = event.and_then(LifecycleProjection::into_lifecycle) {
+                    return Ok((Some(event), committed_end));
+                }
+            } else {
+                committed_end = next_line_start;
             }
-            position = position.saturating_add(read as u64);
-            process_line(runtime, &path, line.trim_end(), true, Some(app));
+            line_end = Some(next_line_start - 1);
         }
-        runtime.file_offsets.insert(path, position);
+        block_end = block_start;
+    }
+    if let Some(end) = line_end {
+        file.seek(SeekFrom::Start(0))?;
+        let event = read_lifecycle_projection(file.take(end))?;
+        return Ok((event.and_then(LifecycleProjection::into_lifecycle), committed_end));
+    }
+    Ok((None, committed_end))
+}
+
+fn read_lifecycle_projection(reader: impl Read) -> io::Result<Option<LifecycleProjection>> {
+    match serde_json::from_reader(BufReader::new(reader)) {
+        Ok(event) => Ok(Some(event)),
+        Err(error) if error.is_io() => Err(io::Error::other(error)),
+        Err(_) => Ok(None),
     }
 }
 
@@ -295,6 +436,9 @@ fn reconcile_active_turns(runtime: &mut RuntimeState) {
     let now = SystemTime::now();
     let paths: Vec<PathBuf> = runtime.known_files.iter().cloned().collect();
     for path in paths {
+        if runtime.ignored_files.contains(&path) || !runtime.file_offsets.contains_key(&path) {
+            continue;
+        }
         let Ok(metadata) = fs::metadata(&path) else {
             continue;
         };
@@ -328,7 +472,14 @@ fn reconcile_file_tail(runtime: &mut RuntimeState, path: &Path) {
     }
     // Track the latest lifecycle event per turn seen in the tail.
     let mut latest_by_turn: HashMap<String, (TaskStatus, DateTime<Utc>)> = HashMap::new();
-    for line in reader.lines().map_while(Result::ok) {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if !matches!(reader.read_line(&mut line), Ok(read) if read > 0)
+            || !line.ends_with('\n')
+        {
+            break;
+        }
         if let Some((turn_id, status, ts)) = lifecycle_event(&line) {
             latest_by_turn.insert(turn_id, (status, ts));
         }
@@ -432,33 +583,7 @@ fn process_line(
                 .and_then(Value::as_i64)
                 .and_then(|seconds| Utc.timestamp_opt(seconds, 0).single())
                 .unwrap_or(timestamp);
-            let title = resolve_title(runtime, &thread_id);
-            // End any previously active turn in this thread so a new
-            // task_started does not leave a stale Working record behind.
-            if let Some(previous) = runtime.active_turn_by_thread.get(&thread_id).cloned()
-                && let Some(task) = runtime.tasks.get_mut(&previous)
-            {
-                if task.status == TaskStatus::Working {
-                    task.status = TaskStatus::Completed;
-                    task.finished_at = Some(started_at);
-                    task.duration = (started_at - task.started_at).to_std().ok();
-                }
-            }
-            runtime
-                .active_turn_by_thread
-                .insert(thread_id.clone(), turn_id.to_string());
-            runtime.tasks.insert(
-                turn_id.to_string(),
-                TaskRecord {
-                    turn_id: turn_id.to_string(),
-                    thread_id,
-                    title,
-                    status: TaskStatus::Working,
-                    started_at,
-                    finished_at: None,
-                    duration: None,
-                },
-            );
+            start_task(runtime, &thread_id, turn_id, started_at);
         }
         "task_complete" | "turn_completed" => {
             let Some(turn_id) = payload.get("turn_id").and_then(Value::as_str) else {
@@ -531,6 +656,39 @@ fn process_line(
     }
 }
 
+fn start_task(
+    runtime: &mut RuntimeState,
+    thread_id: &str,
+    turn_id: &str,
+    started_at: DateTime<Utc>,
+) {
+    let title = resolve_title(runtime, thread_id);
+    // A new start supersedes the previously active turn in this conversation.
+    if let Some(previous) = runtime.active_turn_by_thread.get(thread_id).cloned()
+        && let Some(task) = runtime.tasks.get_mut(&previous)
+        && task.status == TaskStatus::Working
+    {
+        task.status = TaskStatus::Completed;
+        task.finished_at = Some(started_at);
+        task.duration = (started_at - task.started_at).to_std().ok();
+    }
+    runtime
+        .active_turn_by_thread
+        .insert(thread_id.to_string(), turn_id.to_string());
+    runtime.tasks.insert(
+        turn_id.to_string(),
+        TaskRecord {
+            turn_id: turn_id.to_string(),
+            thread_id: thread_id.to_string(),
+            title,
+            status: TaskStatus::Working,
+            started_at,
+            finished_at: None,
+            duration: None,
+        },
+    );
+}
+
 fn resolve_title(runtime: &RuntimeState, thread_id: &str) -> String {
     runtime
         .thread_titles
@@ -584,29 +742,62 @@ fn should_notify_completion(
         && runtime.notified_turns.insert(turn_id.to_string())
 }
 
-fn read_session_metadata(path: &Path) -> Option<(String, bool)> {
-    let file = File::open(path).ok()?;
-    let line = BufReader::new(file).lines().next()?.ok()?;
-    let value = serde_json::from_str::<Value>(&line).ok()?;
-    if value.get("type").and_then(Value::as_str) != Some("session_meta") {
-        return None;
+#[derive(Debug, PartialEq, Eq)]
+enum SessionMetadata {
+    Ready(String),
+    Pending,
+    Ignored,
+}
+
+#[derive(Deserialize)]
+struct SessionMetadataProjection {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    payload: Option<SessionMetadataPayload>,
+}
+
+#[derive(Deserialize)]
+struct SessionMetadataPayload {
+    id: Option<Value>,
+    session_id: Option<Value>,
+    thread_source: Option<Value>,
+    parent_thread_id: Option<Value>,
+    agent_nickname: Option<Value>,
+}
+
+fn read_session_metadata(path: &Path) -> SessionMetadata {
+    let Ok(file) = File::open(path) else {
+        return SessionMetadata::Pending;
+    };
+    // Deserialize only the first object and skip its chat/instruction fields.
+    // An incomplete write or temporary I/O failure is retryable; only a
+    // complete, definitively unrelated record is permanently ignored.
+    let Some(Ok(value)) = serde_json::Deserializer::from_reader(BufReader::new(file))
+        .into_iter::<SessionMetadataProjection>()
+        .next()
+    else {
+        return SessionMetadata::Pending;
+    };
+    if value.kind.as_deref() != Some("session_meta") {
+        return SessionMetadata::Ignored;
     }
-    let payload = value.get("payload")?;
-    let thread_id = payload
-        .get("id")
-        .and_then(Value::as_str)
-        .or_else(|| payload.get("session_id").and_then(Value::as_str))?;
-    Uuid::parse_str(thread_id).ok()?;
-    let is_subagent = payload.get("thread_source").and_then(Value::as_str) == Some("subagent")
-        || payload
-            .get("parent_thread_id")
-            .and_then(Value::as_str)
-            .is_some()
-        || payload
-            .get("agent_nickname")
-            .and_then(Value::as_str)
-            .is_some();
-    Some((thread_id.to_string(), is_subagent))
+    let Some(payload) = value.payload else {
+        return SessionMetadata::Ignored;
+    };
+    if payload.thread_source.as_ref().and_then(Value::as_str) == Some("subagent")
+        || payload.parent_thread_id.as_ref().and_then(Value::as_str).is_some()
+        || payload.agent_nickname.as_ref().and_then(Value::as_str).is_some()
+    {
+        return SessionMetadata::Ignored;
+    }
+    let Some(thread_id) = payload.id.as_ref().and_then(Value::as_str)
+        .or_else(|| payload.session_id.as_ref().and_then(Value::as_str)) else {
+        return SessionMetadata::Ignored;
+    };
+    if Uuid::parse_str(&thread_id).is_err() {
+        return SessionMetadata::Ignored;
+    }
+    SessionMetadata::Ready(thread_id.to_string())
 }
 
 fn prune_tasks(runtime: &mut RuntimeState) {
@@ -727,6 +918,31 @@ mod tests {
         file.write_all(text.as_bytes()).unwrap();
     }
 
+    fn append_file(path: &Path, text: &str) {
+        fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .unwrap()
+            .write_all(text.as_bytes())
+            .unwrap();
+    }
+
+    fn session_header(id: &str) -> String {
+        format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\"}}}}\n")
+    }
+
+    fn task_event(event_type: &str, turn_id: &str) -> String {
+        format!(
+            "{{\"type\":\"event_msg\",\"timestamp\":\"2026-09-12T01:00:00Z\",\"payload\":{{\"type\":\"{event_type}\",\"turn_id\":\"{turn_id}\",\"started_at\":1700000000}}}}\n"
+        )
+    }
+
+    fn output_line(bytes: usize) -> String {
+        let prefix = "{\"type\":\"response_item\",\"payload\":{\"output\":\"";
+        let suffix = "\"}}\n";
+        format!("{prefix}{}{suffix}", "x".repeat(bytes - prefix.len() - suffix.len()))
+    }
+
     #[test]
     fn session_index_accepts_current_id_field_and_skips_bad_lines() {
         let path = temp_file("session-index");
@@ -753,9 +969,203 @@ mod tests {
                 "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"thread_source\":\"subagent\"}}}}\n"
             ),
         );
-        assert_eq!(read_session_metadata(&path), Some((id.to_string(), true)));
+        assert_eq!(read_session_metadata(&path), SessionMetadata::Ignored);
         write_file(&path, "{\"type\":\"session_meta\",\"payload\":{}}\n");
-        assert_eq!(read_session_metadata(&path), None);
+        assert_eq!(read_session_metadata(&path), SessionMetadata::Ignored);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn bootstrap_recovers_long_running_start_across_reverse_block_boundary() {
+        let path = temp_file("long-bootstrap");
+        let thread_id = Uuid::new_v4().to_string();
+        let event = task_event("task_started", "long-turn");
+        // The start's midpoint lands on a reverse-read block boundary, and
+        // one large tool response hides it beyond the entire bootstrap tail.
+        let output_bytes = RECOVERY_BLOCK_BYTES as usize * 14 - event.len().div_ceil(2);
+        write_file(
+            &path,
+            &format!("{}{}{}", session_header(&thread_id), event, output_line(output_bytes)),
+        );
+        let mut runtime = RuntimeState::default();
+        bootstrap_file(&mut runtime, &path);
+        let task = runtime.tasks.get("long-turn").unwrap();
+        assert_eq!(task.thread_id, thread_id);
+        assert_eq!(task.status, TaskStatus::Working);
+        assert_eq!(task.started_at.timestamp(), 1700000000);
+        let offset = fs::metadata(&path).unwrap().len();
+        assert_eq!(runtime.file_offsets.get(&path), Some(&offset));
+
+        // Unchanged-file polls consume no history and cannot resurrect a
+        // record that was already removed from the in-memory snapshot.
+        runtime.tasks.clear();
+        runtime.active_turn_by_thread.clear();
+        process_file_updates(&mut runtime, &path, None);
+        assert!(runtime.tasks.is_empty());
+        assert_eq!(runtime.file_offsets.get(&path), Some(&offset));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn bootstrap_does_not_resurrect_a_terminal_turn_hidden_before_long_output() {
+        for terminal in ["task_complete", "turn_completed", "turn_aborted", "turn_failed", "task_failed"] {
+            let path = temp_file("terminal-bootstrap");
+            write_file(
+                &path,
+                &format!(
+                    "{}{}{}{}",
+                    session_header(&Uuid::new_v4().to_string()),
+                    task_event("task_started", "finished-turn"),
+                    task_event(terminal, "finished-turn"),
+                    output_line(MAX_BOOTSTRAP_BYTES as usize + 256),
+                ),
+            );
+            let mut runtime = RuntimeState::default();
+            bootstrap_file(&mut runtime, &path);
+            assert!(runtime.tasks.is_empty(), "restored a turn after {terminal}");
+            assert!(runtime.active_turn_by_thread.is_empty());
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn bootstrap_streams_oversized_completion_without_restoring_its_start() {
+        let path = temp_file("large-completion");
+        let completion = serde_json::json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "task_complete",
+                "turn_id": "finished-turn",
+                "last_agent_message": "x".repeat(MAX_BOOTSTRAP_BYTES as usize + 256),
+            },
+        });
+        write_file(
+            &path,
+            &format!(
+                "{}{}{completion}\n",
+                session_header(&Uuid::new_v4().to_string()),
+                task_event("task_started", "finished-turn"),
+            ),
+        );
+        let mut runtime = RuntimeState::default();
+        bootstrap_file(&mut runtime, &path);
+        assert!(runtime.tasks.is_empty());
+        assert_eq!(runtime.file_offsets[&path], fs::metadata(&path).unwrap().len());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn new_session_retries_empty_and_half_written_metadata() {
+        let path = temp_file("late-metadata");
+        let thread_id = Uuid::new_v4().to_string();
+        let header = session_header(&thread_id);
+        let mut runtime = RuntimeState::default();
+        write_file(&path, "");
+        bootstrap_file(&mut runtime, &path);
+        assert!(!runtime.ignored_files.contains(&path));
+        assert!(!runtime.file_offsets.contains_key(&path));
+        write_file(&path, &header[..header.len() / 2]);
+        process_file_updates(&mut runtime, &path, None);
+        assert!(!runtime.ignored_files.contains(&path));
+        assert!(runtime.tasks.is_empty());
+        append_file(
+            &path,
+            &format!("{}{}", &header[header.len() / 2..], task_event("task_started", "late-turn")),
+        );
+        process_file_updates(&mut runtime, &path, None);
+        assert_eq!(runtime.tasks["late-turn"].thread_id, thread_id);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn new_session_retries_an_initial_open_failure() {
+        let path = temp_file("temporarily-unavailable");
+        let mut runtime = RuntimeState::default();
+        bootstrap_file(&mut runtime, &path);
+        assert!(!runtime.ignored_files.contains(&path));
+        write_file(
+            &path,
+            &format!(
+                "{}{}",
+                session_header(&Uuid::new_v4().to_string()),
+                task_event("task_started", "available-turn"),
+            ),
+        );
+        process_file_updates(&mut runtime, &path, None);
+        assert!(runtime.tasks.contains_key("available-turn"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn confirmed_subagents_and_unrelated_files_are_not_retried() {
+        for header in [
+            format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{}\",\"thread_source\":\"subagent\"}}}}\n", Uuid::new_v4()),
+            "{\"type\":\"unrelated\",\"payload\":{}}\n".to_string(),
+        ] {
+            let path = temp_file("ignored-session");
+            write_file(&path, &header);
+            let mut runtime = RuntimeState::default();
+            bootstrap_file(&mut runtime, &path);
+            assert!(runtime.ignored_files.contains(&path));
+            write_file(
+                &path,
+                &format!("{}{}", session_header(&Uuid::new_v4().to_string()), task_event("task_started", "ignored-turn")),
+            );
+            process_file_updates(&mut runtime, &path, None);
+            assert!(runtime.tasks.is_empty());
+            assert!(!runtime.file_offsets.contains_key(&path));
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn bootstrap_and_incremental_reads_keep_unfinished_event_offsets() {
+        let path = temp_file("partial-event");
+        let header = session_header(&Uuid::new_v4().to_string());
+        let start = task_event("task_started", "partial-turn");
+        let split = start.len() / 2;
+        write_file(&path, &format!("{header}{}", &start[..split]));
+        let mut runtime = RuntimeState::default();
+        bootstrap_file(&mut runtime, &path);
+        assert!(runtime.tasks.is_empty());
+        assert_eq!(runtime.file_offsets[&path], header.len() as u64);
+        process_file_updates(&mut runtime, &path, None);
+        assert_eq!(runtime.file_offsets[&path], header.len() as u64);
+        append_file(&path, &start[split..]);
+        process_file_updates(&mut runtime, &path, None);
+        assert_eq!(runtime.tasks["partial-turn"].status, TaskStatus::Working);
+
+        let completion = task_event("task_complete", "partial-turn");
+        let committed = runtime.file_offsets[&path];
+        append_file(&path, completion.trim_end());
+        process_file_updates(&mut runtime, &path, None);
+        reconcile_file_tail(&mut runtime, &path);
+        assert_eq!(runtime.file_offsets[&path], committed);
+        assert_eq!(runtime.tasks["partial-turn"].status, TaskStatus::Working);
+        append_file(&path, "\n");
+        process_file_updates(&mut runtime, &path, None);
+        assert_eq!(runtime.tasks["partial-turn"].status, TaskStatus::Completed);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn latest_completion_in_bootstrap_tail_wins_over_older_start() {
+        let path = temp_file("tail-completion");
+        write_file(
+            &path,
+            &format!(
+                "{}{}{}{}{}",
+                session_header(&Uuid::new_v4().to_string()),
+                task_event("task_started", "old-turn"),
+                output_line(MAX_BOOTSTRAP_BYTES as usize + 256),
+                task_event("task_started", "new-turn"),
+                task_event("task_complete", "new-turn"),
+            ),
+        );
+        let mut runtime = RuntimeState::default();
+        bootstrap_file(&mut runtime, &path);
+        assert!(runtime.tasks.is_empty());
+        assert!(runtime.active_turn_by_thread.is_empty());
         let _ = fs::remove_file(path);
     }
 

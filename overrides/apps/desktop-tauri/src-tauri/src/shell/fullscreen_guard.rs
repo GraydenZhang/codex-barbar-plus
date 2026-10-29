@@ -1,0 +1,741 @@
+use serde::Serialize;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ScreenRect {
+    pub(crate) left: i32,
+    pub(crate) top: i32,
+    pub(crate) right: i32,
+    pub(crate) bottom: i32,
+}
+
+const FULLSCREEN_EDGE_TOLERANCE: i32 = 8;
+
+pub(crate) fn is_shell_window_class(class_name: &str) -> bool {
+    matches!(
+        class_name,
+        "Progman"
+            | "WorkerW"
+            | "Shell_TrayWnd"
+            | "Shell_SecondaryTrayWnd"
+            | "ShellHandwritingCanvas"
+    ) || class_name.starts_with("ShellHandwritingCanvas ")
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ForegroundClass {
+    #[default]
+    Normal,
+    ShellTransient,
+    RealFullscreen,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForegroundWindowInfo<'a> {
+    pub class_name: &'a str,
+    pub title: &'a str,
+    pub visible: bool,
+    pub minimized: bool,
+    pub own_process: bool,
+    pub matches_fullscreen: bool,
+}
+
+pub fn is_shell_transient_class(class_name: &str, title: &str) -> bool {
+    if is_shell_window_class(class_name)
+        || matches!(
+            class_name,
+            "CabinetWClass" | "ExploreWClass" | "XamlExplorerHostIslandWindow"
+        )
+    {
+        return true;
+    }
+    class_name == "Windows.UI.Core.CoreWindow"
+        && matches!(title.trim(), "Start" | "开始" | "Search" | "搜索")
+}
+
+pub fn classify_foreground(window: ForegroundWindowInfo<'_>) -> ForegroundClass {
+    if window.own_process || !window.visible || window.minimized {
+        return ForegroundClass::Normal;
+    }
+    if is_shell_transient_class(window.class_name, window.title) {
+        return ForegroundClass::ShellTransient;
+    }
+    if window.matches_fullscreen {
+        ForegroundClass::RealFullscreen
+    } else {
+        ForegroundClass::Normal
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn window(
+    class_name: &'static str,
+    title: &'static str,
+) -> ForegroundWindowInfo<'static> {
+    ForegroundWindowInfo {
+        class_name,
+        title,
+        visible: true,
+        minimized: false,
+        own_process: false,
+        matches_fullscreen: false,
+    }
+}
+
+pub(crate) fn supports_renderer_scan(class_name: &str) -> bool {
+    matches!(
+        class_name,
+        "Chrome_WidgetWin_1" | "Chrome_WidgetWin_0" | "MozillaWindowClass" | "CefBrowserWindow"
+    )
+}
+
+pub(crate) fn window_covers_monitor(
+    window: ScreenRect,
+    monitor: ScreenRect,
+    tolerance: i32,
+) -> bool {
+    let tolerance = tolerance.max(0);
+    window.right > window.left
+        && window.bottom > window.top
+        && monitor.right > monitor.left
+        && monitor.bottom > monitor.top
+        && window.left <= monitor.left.saturating_add(tolerance)
+        && window.top <= monitor.top.saturating_add(tolerance)
+        && window.right >= monitor.right.saturating_sub(tolerance)
+        && window.bottom >= monitor.bottom.saturating_sub(tolerance)
+}
+
+pub(crate) fn window_matches_fullscreen(
+    window: ScreenRect,
+    monitor: ScreenRect,
+    tolerance: i32,
+) -> bool {
+    // A custom title bar may remove WS_CAPTION even when the window is merely
+    // maximized (e.g. Codex Desktop). The work area excludes the taskbar, so
+    // covering it is not evidence of fullscreen. Require the monitor bounds
+    // for both top-level windows and the renderer scan below.
+    window_covers_monitor(window, monitor, tolerance)
+}
+
+pub(crate) fn child_window_matches_fullscreen(
+    window: ScreenRect,
+    host: ScreenRect,
+    monitor: ScreenRect,
+    tolerance: i32,
+) -> bool {
+    // Chromium GPU children may temporarily outgrow the maximized host during
+    // a resize. Child windows are clipped by their host, so their raw bounds
+    // cannot establish visible fullscreen coverage outside that host.
+    let visible = ScreenRect {
+        left: window.left.max(host.left),
+        top: window.top.max(host.top),
+        right: window.right.min(host.right),
+        bottom: window.bottom.min(host.bottom),
+    };
+    window_covers_monitor(visible, monitor, tolerance)
+}
+
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct WinRect {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct MonitorInfo {
+    cb_size: u32,
+    rc_monitor: WinRect,
+    rc_work: WinRect,
+    dw_flags: u32,
+}
+
+#[cfg(windows)]
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn GetCurrentProcessId() -> u32;
+    fn GetForegroundWindow() -> isize;
+    fn GetWindowRect(hwnd: isize, rect: *mut WinRect) -> i32;
+    fn GetAncestor(hwnd: isize, flags: u32) -> isize;
+    fn GetWindowThreadProcessId(hwnd: isize, process_id: *mut u32) -> u32;
+    fn GetClassNameW(hwnd: isize, class_name: *mut u16, max_count: i32) -> i32;
+    fn GetWindowTextW(hwnd: isize, text: *mut u16, max_count: i32) -> i32;
+    fn GetMonitorInfoW(monitor: isize, info: *mut MonitorInfo) -> i32;
+    fn MonitorFromWindow(hwnd: isize, flags: u32) -> isize;
+    fn IsWindowVisible(hwnd: isize) -> i32;
+    fn IsIconic(hwnd: isize) -> i32;
+    fn EnumWindows(
+        callback: Option<unsafe extern "system" fn(isize, isize) -> i32>,
+        parameter: isize,
+    ) -> i32;
+    fn EnumChildWindows(
+        parent: isize,
+        callback: Option<unsafe extern "system" fn(isize, isize) -> i32>,
+        parameter: isize,
+    ) -> i32;
+}
+
+#[cfg(windows)]
+struct FullscreenScanContext {
+    process_id: u32,
+    monitor: ScreenRect,
+    found: bool,
+}
+
+#[cfg(windows)]
+fn monitor_rects(hwnd: isize) -> Option<(ScreenRect, ScreenRect)> {
+    const MONITOR_DEFAULTTONEAREST: u32 = 2;
+
+    let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+    if monitor == 0 {
+        return None;
+    }
+
+    let mut info = MonitorInfo {
+        cb_size: std::mem::size_of::<MonitorInfo>() as u32,
+        rc_monitor: WinRect::default(),
+        rc_work: WinRect::default(),
+        dw_flags: 0,
+    };
+    if unsafe { GetMonitorInfoW(monitor, &mut info) } == 0 {
+        return None;
+    }
+
+    Some((
+        ScreenRect {
+            left: info.rc_monitor.left,
+            top: info.rc_monitor.top,
+            right: info.rc_monitor.right,
+            bottom: info.rc_monitor.bottom,
+        },
+        ScreenRect {
+            left: info.rc_work.left,
+            top: info.rc_work.top,
+            right: info.rc_work.right,
+            bottom: info.rc_work.bottom,
+        },
+    ))
+}
+
+#[cfg(windows)]
+fn window_rect(hwnd: isize) -> Option<ScreenRect> {
+    let mut rect = WinRect::default();
+    (unsafe { GetWindowRect(hwnd, &mut rect) } != 0).then_some(ScreenRect {
+        left: rect.left,
+        top: rect.top,
+        right: rect.right,
+        bottom: rect.bottom,
+    })
+}
+
+#[cfg(windows)]
+fn window_class(hwnd: isize) -> String {
+    let mut buffer = [0u16; 256];
+    let length = unsafe { GetClassNameW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32) };
+    if length <= 0 {
+        String::new()
+    } else {
+        String::from_utf16_lossy(&buffer[..length as usize])
+    }
+}
+
+#[cfg(windows)]
+fn window_title(hwnd: isize) -> String {
+    let mut buffer = [0u16; 512];
+    let length = unsafe { GetWindowTextW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32) };
+    if length <= 0 {
+        String::new()
+    } else {
+        String::from_utf16_lossy(&buffer[..length as usize])
+    }
+}
+
+#[cfg(windows)]
+fn is_shell_window(hwnd: isize) -> bool {
+    is_shell_transient_class(&window_class(hwnd), &window_title(hwnd))
+}
+
+#[cfg(windows)]
+pub(crate) fn classify_current_foreground() -> ForegroundClass {
+    let foreground = unsafe { GetForegroundWindow() };
+    if foreground == 0 {
+        return ForegroundClass::Normal;
+    }
+
+    let mut process_id = 0;
+    unsafe { GetWindowThreadProcessId(foreground, &mut process_id) };
+    let own_process = process_id == unsafe { GetCurrentProcessId() };
+    let class_name = window_class(foreground);
+    let title = window_title(foreground);
+    let visible = unsafe { IsWindowVisible(foreground) } != 0;
+    let minimized = unsafe { IsIconic(foreground) } != 0;
+    let matches_fullscreen = !own_process
+        && visible
+        && !minimized
+        && !is_shell_transient_class(&class_name, &title)
+        && detect_fullscreen();
+    classify_foreground(ForegroundWindowInfo {
+        class_name: &class_name,
+        title: &title,
+        visible,
+        minimized,
+        own_process,
+        matches_fullscreen,
+    })
+}
+
+#[cfg(not(windows))]
+pub(crate) fn classify_current_foreground() -> ForegroundClass {
+    ForegroundClass::Normal
+}
+
+#[cfg(windows)]
+fn scan_candidate(hwnd: isize, context: &FullscreenScanContext, child: bool) -> bool {
+    if unsafe { IsWindowVisible(hwnd) } == 0 {
+        return false;
+    }
+    let Some(rect) = window_rect(hwnd) else {
+        return false;
+    };
+    if child {
+        const GA_ROOT: u32 = 2;
+        let Some(host) = window_rect(unsafe { GetAncestor(hwnd, GA_ROOT) }) else {
+            return false;
+        };
+        child_window_matches_fullscreen(rect, host, context.monitor, FULLSCREEN_EDGE_TOLERANCE)
+    } else {
+        window_matches_fullscreen(rect, context.monitor, FULLSCREEN_EDGE_TOLERANCE)
+    }
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn scan_child_window(hwnd: isize, parameter: isize) -> i32 {
+    let context = unsafe { &mut *(parameter as *mut FullscreenScanContext) };
+    if scan_candidate(hwnd, context, true) {
+        context.found = true;
+        0
+    } else {
+        1
+    }
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn scan_top_level_window(hwnd: isize, parameter: isize) -> i32 {
+    let context = unsafe { &mut *(parameter as *mut FullscreenScanContext) };
+    if context.found {
+        return 0;
+    }
+
+    let mut process_id = 0;
+    if unsafe { GetWindowThreadProcessId(hwnd, &mut process_id) } == 0
+        || process_id != context.process_id
+    {
+        return 1;
+    }
+
+    if scan_candidate(hwnd, context, false) {
+        context.found = true;
+        return 0;
+    }
+
+    unsafe { EnumChildWindows(hwnd, Some(scan_child_window), parameter) };
+    if context.found { 0 } else { 1 }
+}
+
+#[cfg(windows)]
+fn process_has_fullscreen_window(process_id: u32, monitor: ScreenRect) -> bool {
+    let mut context = FullscreenScanContext {
+        process_id,
+        monitor,
+        found: false,
+    };
+    unsafe {
+        EnumWindows(
+            Some(scan_top_level_window),
+            (&mut context as *mut FullscreenScanContext) as isize,
+        );
+    }
+    context.found
+}
+
+#[cfg(windows)]
+fn detect_fullscreen() -> bool {
+    let foreground = unsafe { GetForegroundWindow() };
+
+    if foreground == 0 {
+        return false;
+    }
+
+    let mut process_id = 0;
+    unsafe { GetWindowThreadProcessId(foreground, &mut process_id) };
+    if process_id == unsafe { GetCurrentProcessId() } {
+        return false;
+    }
+    if is_shell_window(foreground) {
+        return false;
+    }
+    if unsafe { IsWindowVisible(foreground) } == 0 || unsafe { IsIconic(foreground) } != 0 {
+        return false;
+    }
+
+    let Some(window) = window_rect(foreground) else {
+        return false;
+    };
+    let Some((monitor, _work_area)) = monitor_rects(foreground) else {
+        return false;
+    };
+    if window_matches_fullscreen(window, monitor, FULLSCREEN_EDGE_TOLERANCE) {
+        return true;
+    }
+
+    if supports_renderer_scan(&window_class(foreground)) {
+        process_has_fullscreen_window(process_id, monitor)
+    } else {
+        false
+    }
+}
+
+#[cfg(windows)]
+#[allow(dead_code)]
+pub(crate) fn is_fullscreen_active() -> bool {
+    detect_fullscreen()
+}
+
+#[cfg(not(windows))]
+pub(crate) fn is_fullscreen_active() -> bool {
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn full_monitor_window_is_detected_as_fullscreen() {
+        let monitor = ScreenRect {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        assert!(window_covers_monitor(monitor, monitor, 2));
+        assert!(!window_covers_monitor(
+            ScreenRect {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1032,
+            },
+            monitor,
+            2,
+        ));
+    }
+
+    #[test]
+    fn small_window_edges_are_not_fullscreen() {
+        let monitor = ScreenRect {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        assert!(!window_covers_monitor(
+            ScreenRect {
+                left: 100,
+                top: 100,
+                right: 1820,
+                bottom: 980,
+            },
+            monitor,
+            2,
+        ));
+    }
+
+    #[test]
+    fn borderless_maximized_window_with_resize_borders_is_not_fullscreen() {
+        let monitor = ScreenRect {
+            left: 0,
+            top: 0,
+            right: 1463,
+            bottom: 823,
+        };
+        let window = ScreenRect {
+            left: -7,
+            top: -7,
+            right: 1470,
+            bottom: 782,
+        };
+
+        assert!(!window_matches_fullscreen(window, monitor, 8));
+    }
+
+    #[test]
+    fn decorated_maximized_window_covering_work_area_is_not_fullscreen() {
+        let monitor = ScreenRect {
+            left: 0,
+            top: 0,
+            right: 1463,
+            bottom: 823,
+        };
+        let work_area = ScreenRect {
+            left: 0,
+            top: 0,
+            right: 1463,
+            bottom: 775,
+        };
+
+        assert!(!window_matches_fullscreen(work_area, monitor, 8));
+    }
+
+    #[test]
+    fn codex_desktop_maximized_on_offset_monitor_is_not_fullscreen() {
+        // Physical Win32 bounds captured on the affected machine at 200% DPI.
+        let monitor = ScreenRect {
+            left: 3840,
+            top: 248,
+            right: 6912,
+            bottom: 2168,
+        };
+        let work_area = ScreenRect {
+            bottom: 2072,
+            ..monitor
+        };
+        assert!(!window_matches_fullscreen(
+            work_area,
+            monitor,
+            FULLSCREEN_EDGE_TOLERANCE
+        ));
+        assert!(!child_window_matches_fullscreen(
+            work_area,
+            work_area,
+            monitor,
+            FULLSCREEN_EDGE_TOLERANCE
+        ));
+        assert!(window_matches_fullscreen(
+            monitor,
+            monitor,
+            FULLSCREEN_EDGE_TOLERANCE
+        ));
+    }
+
+    #[test]
+    fn work_area_with_taskbar_on_any_edge_is_not_fullscreen() {
+        let monitor = ScreenRect {
+            left: -1920,
+            top: -1080,
+            right: 0,
+            bottom: 0,
+        };
+        let work_areas = [
+            ScreenRect {
+                left: -1872,
+                ..monitor
+            },
+            ScreenRect {
+                top: -1032,
+                ..monitor
+            },
+            ScreenRect {
+                right: -48,
+                ..monitor
+            },
+            ScreenRect {
+                bottom: -48,
+                ..monitor
+            },
+        ];
+        for work_area in work_areas {
+            assert!(!window_matches_fullscreen(
+                work_area,
+                monitor,
+                FULLSCREEN_EDGE_TOLERANCE
+            ));
+        }
+    }
+
+    #[test]
+    fn true_fullscreen_and_auto_hide_monitor_coverage_remain_detected() {
+        let monitor = ScreenRect {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        assert!(window_matches_fullscreen(
+            monitor,
+            monitor,
+            FULLSCREEN_EDGE_TOLERANCE
+        ));
+        assert!(window_matches_fullscreen(
+            ScreenRect {
+                left: -7,
+                top: -7,
+                right: 1927,
+                bottom: 1087
+            },
+            monitor,
+            FULLSCREEN_EDGE_TOLERANCE,
+        ));
+    }
+
+    #[test]
+    fn normal_edge_renderer_work_area_child_is_not_fullscreen() {
+        let monitor = ScreenRect {
+            left: 0,
+            top: 0,
+            right: 1463,
+            bottom: 823,
+        };
+        let work_area_child = ScreenRect {
+            left: 0,
+            top: 0,
+            right: 1463,
+            bottom: 775,
+        };
+
+        assert!(!child_window_matches_fullscreen(
+            work_area_child,
+            work_area_child,
+            monitor,
+            8
+        ));
+    }
+
+    #[test]
+    fn edge_video_renderer_covering_monitor_is_fullscreen() {
+        let monitor = ScreenRect {
+            left: 0,
+            top: 0,
+            right: 1463,
+            bottom: 823,
+        };
+
+        assert!(child_window_matches_fullscreen(
+            monitor, monitor, monitor, 8
+        ));
+    }
+
+    #[test]
+    fn oversized_gpu_child_is_clipped_to_maximized_codex_host() {
+        // Captured during an actual maximize transition on the affected PC.
+        let monitor = ScreenRect {
+            left: 3840,
+            top: 248,
+            right: 6912,
+            bottom: 2168,
+        };
+        let host = ScreenRect {
+            bottom: 2072,
+            ..monitor
+        };
+        let gpu = ScreenRect {
+            right: 7168,
+            bottom: 2552,
+            ..monitor
+        };
+        assert!(window_covers_monitor(
+            gpu,
+            monitor,
+            FULLSCREEN_EDGE_TOLERANCE
+        ));
+        assert!(!child_window_matches_fullscreen(
+            gpu,
+            host,
+            monitor,
+            FULLSCREEN_EDGE_TOLERANCE
+        ));
+        assert!(child_window_matches_fullscreen(
+            gpu,
+            monitor,
+            monitor,
+            FULLSCREEN_EDGE_TOLERANCE
+        ));
+    }
+
+    #[test]
+    fn shell_windows_are_not_browser_renderer_hosts() {
+        for class_name in [
+            "Progman",
+            "WorkerW",
+            "Shell_TrayWnd",
+            "ShellHandwritingCanvas",
+        ] {
+            assert!(is_shell_window_class(class_name));
+            assert!(!supports_renderer_scan(class_name));
+        }
+    }
+
+    #[test]
+    fn browser_window_classes_allow_renderer_scan() {
+        for class_name in [
+            "Chrome_WidgetWin_1",
+            "Chrome_WidgetWin_0",
+            "MozillaWindowClass",
+            "CefBrowserWindow",
+        ] {
+            assert!(!is_shell_window_class(class_name));
+            assert!(supports_renderer_scan(class_name));
+        }
+    }
+
+    #[test]
+    fn start_and_search_are_shell_transients_not_fullscreen() {
+        assert_eq!(
+            classify_foreground(window("Windows.UI.Core.CoreWindow", "Start")),
+            ForegroundClass::ShellTransient
+        );
+        assert_eq!(
+            classify_foreground(window("Windows.UI.Core.CoreWindow", "Search")),
+            ForegroundClass::ShellTransient
+        );
+        assert_eq!(
+            classify_foreground(window("Windows.UI.Core.CoreWindow", "开始")),
+            ForegroundClass::ShellTransient
+        );
+        assert_eq!(
+            classify_foreground(window("Windows.UI.Core.CoreWindow", "搜索")),
+            ForegroundClass::ShellTransient
+        );
+    }
+
+    #[test]
+    fn explorer_desktop_and_taskbar_are_shell_transients() {
+        for class_name in [
+            "Progman",
+            "WorkerW",
+            "Shell_TrayWnd",
+            "Shell_SecondaryTrayWnd",
+            "CabinetWClass",
+            "ExploreWClass",
+        ] {
+            assert_eq!(
+                classify_foreground(window(class_name, "")),
+                ForegroundClass::ShellTransient
+            );
+        }
+    }
+
+    #[test]
+    fn covering_browser_window_is_real_fullscreen() {
+        let mut info = window("Chrome_WidgetWin_1", "");
+        info.matches_fullscreen = true;
+        assert_eq!(classify_foreground(info), ForegroundClass::RealFullscreen);
+    }
+
+    #[test]
+    fn own_or_hidden_windows_are_normal() {
+        let mut own = window("Chrome_WidgetWin_1", "");
+        own.own_process = true;
+        own.matches_fullscreen = true;
+        assert_eq!(classify_foreground(own), ForegroundClass::Normal);
+
+        let mut hidden = window("Chrome_WidgetWin_1", "");
+        hidden.visible = false;
+        hidden.matches_fullscreen = true;
+        assert_eq!(classify_foreground(hidden), ForegroundClass::Normal);
+    }
+}

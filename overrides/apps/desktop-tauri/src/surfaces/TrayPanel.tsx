@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import {
   dismissTrayPanel,
-  getBootstrapState,
   getFlyoutPinned,
   openCodexUsagePage,
   openSettingsWindow,
@@ -10,6 +9,8 @@ import {
 } from "../lib/tauri";
 import type { BootstrapDto } from "../types/bridge";
 import { useDesktopTasks } from "../hooks/useDesktopTasks";
+import { useTrayBootstrap } from "../hooks/useTrayBootstrap";
+import { resolveLanguage } from "../lib/resolveLanguage";
 import { useProfileUsage } from "../hooks/useProfileUsage";
 import { useTheme } from "../hooks/useTheme";
 import DesktopTaskStatus from "./tray/DesktopTaskStatus";
@@ -46,14 +47,9 @@ function TrayDashboard({ bootstrap }: { bootstrap: BootstrapDto }) {
   const usage = useProfileUsage(bootstrap);
   const desktopTasks = useDesktopTasks();
   useTheme(bootstrap.settings.theme);
-  const language = bootstrap.settings.language;
+  const language = resolveLanguage(bootstrap.settings.language);
   const copy = useMemo(() => trayCopy(language), [language]);
-  const locale =
-    language === "zh-CN"
-      ? "zh-CN"
-      : language === "en-US"
-        ? "en-US"
-        : navigator.language || "en-US";
+  const locale = language;
   const timeZone = systemTimeZone();
   const panel = bootstrap.settings.panel;
   const [pinned, setPinned] = useState(false);
@@ -81,7 +77,7 @@ function TrayDashboard({ bootstrap }: { bootstrap: BootstrapDto }) {
   );
   const primary = usage.state.primary;
   const secondary = usage.state.secondary;
-  const zh = language !== "en-US";
+  const zh = language === "zh-CN";
 
   return (
     <main
@@ -149,7 +145,7 @@ function TrayDashboard({ bootstrap }: { bootstrap: BootstrapDto }) {
 
       <TrayActions
         copy={copy}
-        order={panel.actions.order}
+        order={panel.actions.order.filter((id) => !panel.actions.hidden.includes(id))}
         onRefresh={usage.refresh}
         onOpenUsage={openCodexUsagePage}
         onOpenSettings={openSettingsWindow}
@@ -168,26 +164,11 @@ function TrayDashboard({ bootstrap }: { bootstrap: BootstrapDto }) {
 }
 
 export default function TrayPanel() {
-  const [bootstrap, setBootstrap] = useState<BootstrapDto | null>(null);
-  const [bootstrapError, setBootstrapError] = useState(false);
-
-  useEffect(() => {
-    let active = true;
-    getBootstrapState()
-      .then((state) => {
-        if (active) setBootstrap(state);
-      })
-      .catch(() => {
-        if (active) setBootstrapError(true);
-      });
-    return () => {
-      active = false;
-    };
-  }, []);
+  const { bootstrap, bootstrapError } = useTrayBootstrap();
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
+      if (event.key === "Escape" && !event.defaultPrevented) {
         event.preventDefault();
         void dismissTrayPanel();
       }
@@ -200,7 +181,7 @@ export default function TrayPanel() {
     return (
       <main className="tray-panel tray-panel--macos" aria-label="codex-barbar tray panel">
         <TrayHeader
-          lastUpdatedText="尚未更新"
+          lastUpdatedText={lastUpdatedText(null, resolveLanguage("system"))}
           version="…"
           profile={null}
           copy={trayCopy("system")}

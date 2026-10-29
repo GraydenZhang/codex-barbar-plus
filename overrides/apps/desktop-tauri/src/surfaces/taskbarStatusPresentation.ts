@@ -153,7 +153,7 @@ export function buildTaskbarStatusPresentation(
   const prefs = surface.bootstrap?.settings.taskbarPresentation;
   const plusMode = surface.bootstrap?.settings.taskbarShowFiveHour ?? true;
   const showIcon = prefs?.showTaskbarIcon ?? true;
-  const showAccount = plusMode ? false : (prefs?.showTaskbarAccount ?? true);
+  const showAccount = prefs?.showTaskbarAccount ?? true;
   const showWeeklyLabel = prefs?.showWeeklyLabel ?? true;
   const showWeeklyPercent = prefs?.showWeeklyPercent ?? true;
   const showResetDate = prefs?.showResetDate ?? true;
@@ -176,7 +176,7 @@ export function buildTaskbarStatusPresentation(
     surface.trustState === "cached" ? "缓存数据" : surface.refreshStatus;
   const ariaLabel = [
     "打开完整面板",
-    plusMode ? null : surface.displayName,
+    showAccount ? surface.displayName : null,
     metricsText,
     plusMode ? null : originalMetric?.resetText,
     trustText,

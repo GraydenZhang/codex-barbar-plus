@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { resolveLanguage } from "../../lib/resolveLanguage";
 import type {
   DesktopTaskDto,
   DesktopTaskSnapshotDto,
@@ -40,7 +41,7 @@ export default function DesktopTaskStatus({
   language: "system" | "zh-CN" | "en-US";
 }) {
   const [nowMs, setNowMs] = useState(() => Date.now());
-  const zh = language !== "en-US";
+  const zh = resolveLanguage(language) === "zh-CN";
 
   useEffect(() => {
     if (!snapshot.tasks.some((task) => task.status === "working")) return;
