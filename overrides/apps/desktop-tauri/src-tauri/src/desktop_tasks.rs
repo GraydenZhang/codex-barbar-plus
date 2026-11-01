@@ -24,6 +24,7 @@ const DISCOVERY_INTERVAL_TICKS: u64 = 4;
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 const COMPLETION_SOUND_MINIMUM: Duration = Duration::from_secs(3 * 60);
 const RECENT_FILE_WINDOW: Duration = Duration::from_secs(15);
+const RECENT_TERMINAL_TASK_WINDOW: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -802,25 +803,27 @@ fn read_session_metadata(path: &Path) -> SessionMetadata {
 
 fn prune_tasks(runtime: &mut RuntimeState) {
     // Codex's persisted unread set is not a reliable acknowledgement signal;
-    // it can retain old completed subagent turns indefinitely. Only expose
-    // turns whose latest lifecycle event still proves that they are running.
-    runtime.tasks.retain(|turn_id, task| {
-        task.status == TaskStatus::Working
-            && runtime.active_turn_by_thread.get(&task.thread_id) == Some(turn_id)
+    // old terminal turns can linger indefinitely. Keep live turns plus only
+    // recently-finished terminal turns so the UI can show "ready/error"
+    // transitions without reviving stale history.
+    let now = Utc::now();
+    runtime.tasks.retain(|turn_id, task| match task.status {
+        TaskStatus::Working => runtime.active_turn_by_thread.get(&task.thread_id) == Some(turn_id),
+        TaskStatus::Completed | TaskStatus::Error => task.finished_at.is_some_and(|finished| {
+            (now - finished)
+                .to_std()
+                .is_ok_and(|age| age <= RECENT_TERMINAL_TASK_WINDOW)
+        }),
     });
 }
 
 fn publish_snapshot(app: &AppHandle, runtime: &RuntimeState) {
     let mut latest_by_thread: HashMap<&str, &TaskRecord> = HashMap::new();
-    for task in runtime
-        .tasks
-        .values()
-        .filter(|task| task.status == TaskStatus::Working)
-    {
+    for task in runtime.tasks.values() {
         latest_by_thread
             .entry(&task.thread_id)
             .and_modify(|current| {
-                if task.started_at > current.started_at {
+                if task_activity_at(task) > task_activity_at(current) {
                     *current = task;
                 }
             })
@@ -830,7 +833,7 @@ fn publish_snapshot(app: &AppHandle, runtime: &RuntimeState) {
     tasks.sort_by(|left, right| {
         status_rank(left.status)
             .cmp(&status_rank(right.status))
-            .then_with(|| right.started_at.cmp(&left.started_at))
+            .then_with(|| task_activity_at(right).cmp(&task_activity_at(left)))
     });
     let tasks = tasks
         .into_iter()
@@ -860,6 +863,10 @@ fn status_rank(status: TaskStatus) -> u8 {
         TaskStatus::Error => 1,
         TaskStatus::Completed => 2,
     }
+}
+
+fn task_activity_at(task: &TaskRecord) -> DateTime<Utc> {
+    task.finished_at.unwrap_or(task.started_at)
 }
 
 fn to_dto(task: &TaskRecord) -> DesktopTaskDto {
@@ -1194,31 +1201,81 @@ mod tests {
     }
 
     #[test]
-    fn pruning_drops_completed_and_superseded_turns() {
+    fn pruning_keeps_recent_terminal_turns_for_ready_and_error_ui_states() {
+        let now = Utc::now();
         let thread_id = Uuid::new_v4().to_string();
         let mut runtime = RuntimeState::default();
-        runtime
-            .active_turn_by_thread
-            .insert(thread_id.clone(), "new".to_string());
-        for (turn_id, status) in [
-            ("old", TaskStatus::Working),
-            ("done", TaskStatus::Completed),
-        ] {
-            runtime.tasks.insert(
-                turn_id.to_string(),
-                TaskRecord {
-                    turn_id: turn_id.to_string(),
-                    thread_id: thread_id.clone(),
-                    title: "Task".to_string(),
-                    status,
-                    started_at: Utc::now(),
-                    finished_at: None,
-                    duration: None,
-                },
-            );
-        }
+        runtime.tasks.insert(
+            "completed".to_string(),
+            TaskRecord {
+                turn_id: "completed".to_string(),
+                thread_id: thread_id.clone(),
+                title: "Done".to_string(),
+                status: TaskStatus::Completed,
+                started_at: now - chrono::Duration::minutes(2),
+                finished_at: Some(now - chrono::Duration::minutes(1)),
+                duration: Some(Duration::from_secs(60)),
+            },
+        );
+        runtime.tasks.insert(
+            "error".to_string(),
+            TaskRecord {
+                turn_id: "error".to_string(),
+                thread_id,
+                title: "Failed".to_string(),
+                status: TaskStatus::Error,
+                started_at: now - chrono::Duration::minutes(3),
+                finished_at: Some(now - chrono::Duration::seconds(30)),
+                duration: Some(Duration::from_secs(150)),
+            },
+        );
+        prune_tasks(&mut runtime);
+        assert!(runtime.tasks.contains_key("completed"));
+        assert!(runtime.tasks.contains_key("error"));
+    }
+
+    #[test]
+    fn pruning_drops_stale_terminal_turns_outside_recent_window() {
+        let thread_id = Uuid::new_v4().to_string();
+        let mut runtime = RuntimeState::default();
+        let stale_finish = Utc::now() - chrono::Duration::minutes(30);
+        runtime.tasks.insert(
+            "stale".to_string(),
+            TaskRecord {
+                turn_id: "stale".to_string(),
+                thread_id,
+                title: "Old done".to_string(),
+                status: TaskStatus::Completed,
+                started_at: stale_finish - chrono::Duration::minutes(2),
+                finished_at: Some(stale_finish),
+                duration: Some(Duration::from_secs(120)),
+            },
+        );
         prune_tasks(&mut runtime);
         assert!(runtime.tasks.is_empty());
+    }
+
+    #[test]
+    fn pruning_keeps_terminal_turn_exactly_on_recent_window_boundary() {
+        let now = Utc::now();
+        let thread_id = Uuid::new_v4().to_string();
+        let mut runtime = RuntimeState::default();
+        let boundary_finish =
+            now - chrono::Duration::seconds(RECENT_TERMINAL_TASK_WINDOW.as_secs() as i64);
+        runtime.tasks.insert(
+            "boundary".to_string(),
+            TaskRecord {
+                turn_id: "boundary".to_string(),
+                thread_id,
+                title: "Boundary".to_string(),
+                status: TaskStatus::Completed,
+                started_at: boundary_finish - chrono::Duration::minutes(1),
+                finished_at: Some(boundary_finish),
+                duration: Some(Duration::from_secs(60)),
+            },
+        );
+        prune_tasks(&mut runtime);
+        assert!(runtime.tasks.contains_key("boundary"));
     }
 
     #[test]
